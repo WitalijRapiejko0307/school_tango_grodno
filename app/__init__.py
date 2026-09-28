@@ -1,0 +1,1 @@
+"""TangoGrodno application package."""
