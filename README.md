@@ -32,6 +32,8 @@ Telegram delivers updates to **`{PUBLIC_URL}/telegram/webhook`** (POST). Registe
 uvicorn app.main:app --reload
 ```
 
+Railway uses railpack.json start command; set PORT is injected by Railway; required env DATABASE_URL, BOT_TOKEN, WEBHOOK_SECRET, PUBLIC_URL.
+
 Health check: [http://127.0.0.1:8000/health](http://127.0.0.1:8000/health)
 
 ## Tests
