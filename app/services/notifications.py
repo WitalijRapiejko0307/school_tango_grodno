@@ -12,6 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models import (
+    Attendance,
     DropInCharge,
     Group,
     GroupMembership,
@@ -83,6 +84,18 @@ def _previous_calendar_month_bounds(now: datetime) -> tuple[datetime, datetime]:
     else:
         prev_start = datetime(local.year, local.month - 1, 1, tzinfo=_school_tz())
     return prev_start, first_this
+
+
+async def _already_marked(
+    session: AsyncSession, person_id: str, school_session_id: str
+) -> bool:
+    existing = await session.scalar(
+        select(Attendance.id).where(
+            Attendance.person_id == person_id,
+            Attendance.session_id == school_session_id,
+        )
+    )
+    return existing is not None
 
 
 async def _find_reminder(
@@ -211,6 +224,8 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
     for start_reminder, school_session in coming_result.all():
         if _as_aware(school_session.ends_at) > _as_aware(now):
             continue
+        if await _already_marked(session, start_reminder.person_id, school_session.id):
+            continue
         existing = await _find_reminder(
             session,
             start_reminder.person_id,
@@ -243,6 +258,8 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
     for ask in nudge_result.scalars().all():
         sent_at = _as_aware(ask.sent_at)
         if ask.sent_at is None or sent_at > _as_aware(now) - nudge_after:
+            continue
+        if ask.session_id and await _already_marked(session, ask.person_id, ask.session_id):
             continue
         person, _ = await _person_telegram(session, ask.person_id)
         text = (

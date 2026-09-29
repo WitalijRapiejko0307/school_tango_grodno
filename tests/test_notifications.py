@@ -110,6 +110,33 @@ async def test_record_coming_then_attendance_ask_after_end(
     assert "были на занятии" in asks[0].text.lower()
 
 
+async def test_attendance_ask_skipped_when_already_marked(
+    db_session: AsyncSession,
+) -> None:
+    person, group_id = await _client_in_group(db_session)
+    starts = datetime(2026, 7, 2, 19, 0, tzinfo=MINSK)
+    ends = starts + timedelta(hours=1)
+    school_session = await create_session(
+        db_session,
+        group_id,
+        starts_at=starts,
+        ends_at=ends,
+        place="Studio",
+        bring_notes=None,
+    )
+    drop_in = await create_product(db_session, "drop_in", "Visit")
+    await set_price(db_session, drop_in.id, Decimal("15.00"), date(2026, 1, 1))
+    await record_coming(db_session, person.id, school_session.id, starts - timedelta(hours=1))
+    await mark_attendance(db_session, person.id, school_session.id, "admin")
+
+    due = await plan_due(db_session, ends + timedelta(minutes=1))
+    assert not [
+        d
+        for d in due
+        if d.person_id == person.id and d.kind == "attendance_ask"
+    ]
+
+
 async def test_answer_yes_creates_attendance_when_not_admin(
     db_session: AsyncSession,
 ) -> None:
