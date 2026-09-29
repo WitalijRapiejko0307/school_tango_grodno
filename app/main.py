@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException, Request
 
 from app.channels.telegram import reminder_inline_markup, router as telegram_router
 from app.config import get_settings
-from app.db import async_session_maker
+from app.db import Base, async_session_maker, engine
 from app.services.notifications import mark_sent, plan_due
 
 logger = logging.getLogger(__name__)
@@ -54,14 +54,34 @@ async def _reminder_loop(bot: Bot) -> None:
         await asyncio.sleep(60)
 
 
+async def _register_telegram_webhook(bot: Bot, settings) -> None:
+    public_url = settings.PUBLIC_URL.strip()
+    if not public_url:
+        return
+    webhook_url = f"{public_url.rstrip('/')}/telegram/webhook"
+    kwargs: dict[str, str] = {}
+    if settings.WEBHOOK_SECRET:
+        kwargs["secret_token"] = settings.WEBHOOK_SECRET
+    await bot.set_webhook(webhook_url, **kwargs)
+    logger.info("Telegram webhook registered for %s", webhook_url)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     settings = get_settings()
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
 
     bot: Bot | None = None
     task: asyncio.Task | None = None
     if settings.BOT_TOKEN:
         bot = Bot(token=settings.BOT_TOKEN)
+        if settings.PUBLIC_URL.strip():
+            try:
+                await _register_telegram_webhook(bot, settings)
+            except Exception:
+                logger.exception("Failed to register Telegram webhook")
         task = asyncio.create_task(_reminder_loop(bot))
 
     app.state.bot = bot
