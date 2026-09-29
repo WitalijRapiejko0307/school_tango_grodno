@@ -44,7 +44,11 @@ from app.services.billing import (
     open_subscription,
     set_price,
 )
-from app.services.identity import invite_admin, upsert_from_telegram
+from app.services.identity import (
+    has_pending_phone_invite,
+    invite_admin,
+    upsert_from_telegram,
+)
 from app.services.notifications import (
     DueReminder,
     answer_attendance,
@@ -103,6 +107,19 @@ def role_keyboard(role: str) -> list[str]:
     if role == "client":
         return list(CLIENT_MENU)
     return list(GUEST_MENU)
+
+
+BTN_SHARE_PHONE = "Подтвердить телефон"
+
+
+def _guest_keyboard_with_phone() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_SHARE_PHONE, request_contact=True)],
+            [KeyboardButton(text=BTN_SCHEDULE), KeyboardButton(text=BTN_CONTACTS)],
+        ],
+        resize_keyboard=True,
+    )
 
 
 def _reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
@@ -376,9 +393,49 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     person = await _ensure_person(message)
     if person is None:
         return
+    markup = _reply_markup_for_role(person.role)
+    text = f"Здравствуйте, {person.full_name}!"
+    if person.role == "guest":
+        async with async_session_maker() as session:
+            ask_phone = await has_pending_phone_invite(session)
+        if ask_phone:
+            markup = _guest_keyboard_with_phone()
+            text += (
+                "\n\nЕсли вас пригласили администратором, нажмите «Подтвердить телефон» "
+                "и отправьте свой номер. Иначе откройте расписание как гость."
+            )
+    await message.answer(text, reply_markup=markup)
+
+
+@router.message(F.contact)
+async def on_contact(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or message.contact is None:
+        return
+    contact = message.contact
+    if contact.user_id is not None and contact.user_id != message.from_user.id:
+        await message.answer("Отправьте свой номер кнопкой «Подтвердить телефон».")
+        return
+    await state.clear()
+    async with async_session_maker() as session:
+        person = await upsert_from_telegram(
+            session,
+            telegram_user_id=message.from_user.id,
+            username=message.from_user.username,
+            full_name=message.from_user.full_name or "User",
+            phone=contact.phone_number,
+        )
+        await session.commit()
+        role = person.role
+        name = person.full_name
+    if role == "admin":
+        await message.answer(
+            f"{name}, вы администратор.",
+            reply_markup=_reply_markup_for_role("admin"),
+        )
+        return
     await message.answer(
-        f"Здравствуйте, {person.full_name}!",
-        reply_markup=_reply_markup_for_role(person.role),
+        "Этот номер не найден среди приглашений администраторов.",
+        reply_markup=_reply_markup_for_role("guest"),
     )
 
 
@@ -596,13 +653,27 @@ async def cb_assign_group(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer(REFUSAL, show_alert=True)
         return
     today = _today_local()
+    notify_id: int | None = None
     async with async_session_maker() as session:
+        target = await session.get(Person, person_id)
+        was_guest = target is not None and target.role == "guest"
         await assign_group(session, person_id, group_id, today)
         await session.commit()
+        if was_guest and target is not None and target.telegram_user_id is not None:
+            notify_id = target.telegram_user_id
     await state.clear()
     await query.answer("Готово")
     if query.message:
         await query.message.answer("Человек назначен в группу.")
+    if notify_id is not None:
+        try:
+            await query.bot.send_message(
+                notify_id,
+                "Вас записали в группу. Теперь вы клиент школы.",
+                reply_markup=_reply_markup_for_role("client"),
+            )
+        except Exception:
+            logger.exception("Failed to refresh client menu for %s", notify_id)
 
 
 @router.callback_query(F.data.startswith("open_sub_p:"))

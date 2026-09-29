@@ -72,6 +72,28 @@ async def test_admin_invite_by_username_pending_then_activates_on_upsert(
     assert updated_invite.person_id == person.id
 
 
+async def test_phone_invite_matches_different_formatting(
+    db_session: AsyncSession,
+) -> None:
+    admin = Person(full_name="Admin", role="admin", telegram_user_id=1, username="admin")
+    db_session.add(admin)
+    await db_session.flush()
+
+    invite = await invite_admin(db_session, admin, username=None, phone="+375 (44) 724-72-72")
+    assert invite.status == "pending"
+    assert invite.phone == "375447247272"
+
+    person = await upsert_from_telegram(
+        db_session,
+        telegram_user_id=2003,
+        username="lavka",
+        full_name="Guest",
+        phone="375447247272",
+    )
+    assert person.role == "admin"
+    assert person.phone == "375447247272"
+
+
 async def test_non_admin_cannot_invite(db_session: AsyncSession) -> None:
     guest = Person(full_name="Guest", role="guest", telegram_user_id=3003)
     db_session.add(guest)
