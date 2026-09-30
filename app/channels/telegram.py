@@ -66,7 +66,6 @@ from app.services.schedule import (
     create_group,
     create_stream,
     create_weekly_slot,
-    list_month_sessions,
     materialize_range,
     override_occurrence,
     parse_dmy,
@@ -377,6 +376,10 @@ class SlotFSM(StatesGroup):
     duration = State()
     place = State()
     bring_notes = State()
+
+
+class GuestPickFSM(StatesGroup):
+    number = State()
 
 
 class WeekFSM(StatesGroup):
@@ -1225,40 +1228,78 @@ async def menu_other_group(message: Message) -> None:
 
 
 @router.message(F.text == BTN_SCHEDULE)
-async def menu_schedule(message: Message) -> None:
+async def menu_schedule(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
         person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
         if person is None:
             return
         now_local = datetime.now(_school_tz())
-        sessions = await list_month_sessions(
-            session, now_local.year, now_local.month, get_settings().SCHOOL_TZ
+        today = now_local.date()
+        week_end = today + timedelta(days=7)
+        await materialize_range(session, today, week_end)
+        week_end_utc = datetime(
+            week_end.year, week_end.month, week_end.day, tzinfo=_school_tz()
+        ).astimezone(UTC)
+        result = await session.execute(
+            select(SchoolSession)
+            .where(
+                SchoolSession.status == "scheduled",
+                SchoolSession.starts_at >= now_local.astimezone(UTC),
+                SchoolSession.starts_at < week_end_utc,
+            )
+            .order_by(SchoolSession.starts_at)
         )
+        sessions = list(result.scalars().all())
         await session.commit()
         if not sessions:
             contacts = await _format_contacts(session)
             await message.answer(
-                "В этом месяце открытых занятий нет.\n\n" + contacts
+                "На ближайшие 7 дней занятий нет. Ниже только предстоящая неделя, не весь месяц.\n\n"
+                + contacts
             )
             return
-        lines = ["Расписание:"]
-        buttons = []
-        for s in sessions:
-            gname = await _session_group_name(session, s.group_id)
-            local_t = _format_session_local(s.starts_at)
-            lines.append(f"• {local_t} — {gname}, {s.place}")
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"Буду {local_t}",
-                        callback_data=f"rsvp:{s.id}",
-                    )
-                ]
-            )
-        await message.answer(
-            "\n".join(lines),
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
-        )
+        lines = [
+            "Расписание на ближайшие 7 дней.",
+            "Показана только предстоящая неделя, не весь месяц.",
+            "Напишите номер занятия, на которое придёте.",
+        ]
+        choices: dict[str, str] = {}
+        for index, school_session in enumerate(sessions, start=1):
+            gname = await _session_group_name(session, school_session.group_id)
+            local_t = _format_session_local(school_session.starts_at)
+            lines.append(f"{index}. {local_t} — {gname}, {school_session.place}")
+            choices[str(index)] = school_session.id
+        await state.set_state(GuestPickFSM.number)
+        await state.update_data(guest_choices=choices)
+        await message.answer("\n".join(lines))
+
+
+@router.message(GuestPickFSM.number, F.text.regexp(r"^\s*\d+\s*$"))
+async def fsm_guest_pick(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or message.text is None:
+        return
+    data = await state.get_data()
+    choices = data.get("guest_choices") or {}
+    session_id = choices.get(message.text.strip())
+    if session_id is None:
+        await message.answer("Нет такого номера. Напишите число из списка.")
+        return
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, message.from_user.id)
+        if person is None:
+            await state.clear()
+            await message.answer("Сначала нажмите /start")
+            return
+        await guest_rsvp(session, person.id, session_id)
+        school_session = await session.get(SchoolSession, session_id)
+        gname = ""
+        when = ""
+        if school_session is not None:
+            gname = await _session_group_name(session, school_session.group_id)
+            when = _format_session_local(school_session.starts_at)
+        await session.commit()
+    await state.clear()
+    await message.answer(f"Вы записаны: {when}, {gname}.")
 
 
 @router.message(F.text == BTN_CONTACTS)
