@@ -1,7 +1,7 @@
 """SQLAlchemy ORM models for the tango school domain."""
 
 import uuid
-from datetime import date, datetime
+from datetime import date, datetime, time
 from decimal import Decimal
 
 from sqlalchemy import (
@@ -10,6 +10,7 @@ from sqlalchemy import (
     CheckConstraint,
     Date,
     DateTime,
+    Time,
     ForeignKey,
     Index,
     Integer,
@@ -122,13 +123,51 @@ class GroupMembership(Base):
     ended_on: Mapped[date | None] = mapped_column(Date, nullable=True)
 
 
-class SchoolSession(Base):
-    __tablename__ = "school_sessions"
+class WeeklySlot(Base):
+    """One row for a class that repeats every week. Concrete dates are derived, not stored."""
+
+    __tablename__ = "weekly_slots"
+    __table_args__ = (
+        UniqueConstraint(
+            "group_id",
+            "weekday",
+            "start_time",
+            name="uq_weekly_slots_group_weekday_start",
+        ),
+        CheckConstraint("weekday >= 0 AND weekday <= 6", name="ck_weekly_slots_weekday"),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     group_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("groups.id"), nullable=False
     )
+    weekday: Mapped[int] = mapped_column(Integer, nullable=False)
+    start_time: Mapped[time] = mapped_column(Time, nullable=False)
+    end_time: Mapped[time] = mapped_column(Time, nullable=False)
+    place: Mapped[str] = mapped_column(String(255), nullable=False)
+    notes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+
+
+class SchoolSession(Base):
+    __tablename__ = "school_sessions"
+    __table_args__ = (
+        UniqueConstraint(
+            "weekly_slot_id",
+            "session_date",
+            name="uq_school_sessions_slot_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    group_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("groups.id"), nullable=False
+    )
+    weekly_slot_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("weekly_slots.id"), nullable=True
+    )
+    session_date: Mapped[date | None] = mapped_column(Date, nullable=True)
+    overridden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     starts_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     ends_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     place: Mapped[str] = mapped_column(String(255), nullable=False)

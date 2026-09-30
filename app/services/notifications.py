@@ -170,6 +170,11 @@ async def record_coming(
 
 
 async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
+    from app.services.schedule import materialize_range
+
+    local_today = _to_local(now).date()
+    await materialize_range(session, local_today, local_today + timedelta(days=2))
+
     due: list[DueReminder] = []
     lead = timedelta(hours=START_LEAD_HOURS)
     nudge_after = timedelta(hours=NUDGE_AFTER_HOURS)

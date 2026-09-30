@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 
 import pytest
 from sqlalchemy import select
@@ -10,7 +10,12 @@ from app.services.schedule import (
     assign_group,
     create_group,
     create_session,
+    create_weekly_slot,
     list_month_sessions,
+    materialize_range,
+    override_occurrence,
+    parse_dmy,
+    update_weekly_slot,
 )
 
 
@@ -110,3 +115,38 @@ async def test_create_session_rejects_inverted_times(
 
     result = await db_session.execute(select(SchoolSession))
     assert len(result.scalars().all()) == 0
+
+
+def test_parse_dmy() -> None:
+    assert parse_dmy("30-09-2026") == date(2026, 9, 30)
+    with pytest.raises(ValueError):
+        parse_dmy("2026-09-30")
+
+
+async def test_override_one_date_is_kept_when_weekly_slot_changes(
+    db_session: AsyncSession,
+) -> None:
+    group = await create_group(db_session, "1 группа")
+    slot = await create_weekly_slot(
+        db_session, group.id, 4, time(19, 0), time(20, 0), "Зал", None
+    )
+    today = date.today()
+    friday = today + timedelta(days=(4 - today.weekday()) % 7)
+    next_friday = friday + timedelta(days=7)
+    await materialize_range(db_session, friday, next_friday + timedelta(days=1))
+    await override_occurrence(
+        db_session, slot.id, friday, time(18, 0), time(19, 0), "Другой зал", "один раз"
+    )
+    await update_weekly_slot(
+        db_session, slot.id, 4, time(20, 0), time(21, 0), "Новый зал", None
+    )
+    rows = (
+        await db_session.execute(
+            select(SchoolSession).order_by(SchoolSession.session_date)
+        )
+    ).scalars().all()
+    by_date = {row.session_date: row for row in rows}
+    assert by_date[friday].place == "Другой зал"
+    assert by_date[friday].overridden is True
+    assert by_date[next_friday].place == "Новый зал"
+    assert by_date[next_friday].overridden is False

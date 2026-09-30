@@ -27,6 +27,7 @@ from app.config import get_settings
 from app.db import async_session_maker
 from app.models import (
     Attendance,
+    WeeklySlot,
     ContactCard,
     Group,
     GroupMembership,
@@ -58,12 +59,18 @@ from app.services.notifications import (
     record_coming,
 )
 from app.services.schedule import (
+    WEEKDAY_LABELS,
     add_stream_member,
     assign_group,
+    cancel_occurrence,
     create_group,
-    create_session,
     create_stream,
+    create_weekly_slot,
     list_month_sessions,
+    materialize_range,
+    override_occurrence,
+    parse_dmy,
+    update_weekly_slot,
 )
 
 logger = logging.getLogger(__name__)
@@ -141,6 +148,30 @@ def _reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
     return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
 
 
+def _weekday_keyboard(prefix: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text=WEEKDAY_LABELS[i], callback_data=f"{prefix}:{i}")
+                for i in range(0, 4)
+            ],
+            [
+                InlineKeyboardButton(text=WEEKDAY_LABELS[i], callback_data=f"{prefix}:{i}")
+                for i in range(4, 7)
+            ],
+        ]
+    )
+
+
+def _parse_hhmm(text: str) -> tuple[int, int] | None:
+    if not re.match(r"^\d{1,2}:\d{2}$", text.strip()):
+        return None
+    hour, minute = map(int, text.strip().split(":"))
+    if hour > 23 or minute > 59:
+        return None
+    return hour, minute
+
+
 def _school_tz() -> ZoneInfo:
     return ZoneInfo(get_settings().SCHOOL_TZ)
 
@@ -196,6 +227,7 @@ async def _list_today_sessions(session: AsyncSession, day: date) -> list[SchoolS
     day_end = day_start + timedelta(days=1)
     start_utc = day_start.astimezone(UTC)
     end_utc = day_end.astimezone(UTC)
+    await materialize_range(session, day, day + timedelta(days=1))
     result = await session.execute(
         select(SchoolSession)
         .where(
@@ -345,6 +377,14 @@ class SlotFSM(StatesGroup):
     duration = State()
     place = State()
     bring_notes = State()
+
+
+class WeekFSM(StatesGroup):
+    time_str = State()
+    duration = State()
+    place = State()
+    notes = State()
+    once_date = State()
 
 
 class StreamFSM(StatesGroup):
@@ -602,11 +642,13 @@ async def cb_pick_group_slot(query: CallbackQuery, state: FSMContext) -> None:
     if person is None or not _is_admin(person):
         await query.answer(REFUSAL, show_alert=True)
         return
-    await state.set_state(SlotFSM.date_str)
-    await state.update_data(group_id=group_id)
+    await state.update_data(mode="new", group_id=group_id)
     await query.answer()
     if query.message:
-        await query.message.answer("Дата занятия (ГГГГ-ММ-ДД):")
+        await query.message.answer(
+            "День недели:",
+            reply_markup=_weekday_keyboard("wday"),
+        )
 
 
 @router.callback_query(F.data.startswith("pick_person:"))
@@ -946,6 +988,7 @@ async def menu_today(message: Message) -> None:
             return
         today = _today_local()
         sessions = await _list_today_sessions(session, today)
+        await session.commit()
         if not sessions:
             await message.answer("На сегодня занятий нет.")
             return
@@ -979,7 +1022,9 @@ async def menu_groups(message: Message) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Новая группа", callback_data="admin_new_group")],
-            [InlineKeyboardButton(text="Слот", callback_data="admin_slot")],
+            [InlineKeyboardButton(text="Недельный слот", callback_data="admin_slot")],
+            [InlineKeyboardButton(text="Изменить график", callback_data="admin_edit_week")],
+            [InlineKeyboardButton(text="Одно занятие", callback_data="admin_edit_once")],
         ]
     )
     await message.answer(text, reply_markup=kb)
@@ -1108,6 +1153,9 @@ async def menu_my_group(message: Message) -> None:
             await message.answer("Вы пока не в группе.")
             return
         gname = await _session_group_name(session, membership.group_id)
+        today = _today_local()
+        await materialize_range(session, today, today + timedelta(days=21))
+        await session.commit()
         now = datetime.now(UTC)
         next_result = await session.execute(
             select(SchoolSession)
@@ -1154,6 +1202,7 @@ async def menu_other_group(message: Message) -> None:
         my_group_id = membership.group_id if membership else None
         today = _today_local()
         sessions = await _list_today_sessions(session, today)
+        await session.commit()
         sessions = [s for s in sessions if s.group_id != my_group_id]
         if not sessions:
             await message.answer("Сегодня нет других занятий.")
@@ -1185,6 +1234,7 @@ async def menu_schedule(message: Message) -> None:
         sessions = await list_month_sessions(
             session, now_local.year, now_local.month, get_settings().SCHOOL_TZ
         )
+        await session.commit()
         if not sessions:
             contacts = await _format_contacts(session)
             await message.answer(
@@ -1300,85 +1350,246 @@ async def fsm_new_group(message: Message, state: FSMContext) -> None:
     await state.clear()
 
 
-@router.message(SlotFSM.date_str)
-async def fsm_slot_date(message: Message, state: FSMContext) -> None:
+async def _slot_button_rows(session: AsyncSession, prefix: str) -> list[list[InlineKeyboardButton]]:
+    rows = (
+        await session.execute(
+            select(WeeklySlot, Group)
+            .join(Group, WeeklySlot.group_id == Group.id)
+            .where(WeeklySlot.active.is_(True))
+            .order_by(Group.name, WeeklySlot.weekday, WeeklySlot.start_time)
+        )
+    ).all()
+    buttons = []
+    for slot, group in rows:
+        label = (
+            f"{group.name} {WEEKDAY_LABELS[slot.weekday]} "
+            f"{slot.start_time.strftime('%H:%M')}"
+        )
+        if slot.notes:
+            label = f"{label} ({slot.notes})"
+        buttons.append(
+            [InlineKeyboardButton(text=label[:60], callback_data=f"{prefix}:{slot.id}")]
+        )
+    return buttons
+
+
+@router.callback_query(F.data.startswith("wday:"))
+async def cb_weekday(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    weekday = int(query.data.split(":", 1)[1])
+    await state.update_data(weekday=weekday)
+    await state.set_state(WeekFSM.time_str)
+    await query.answer()
+    if query.message:
+        await query.message.answer("Время начала (ЧЧ:ММ):")
+
+
+@router.callback_query(F.data == "admin_edit_week")
+async def cb_admin_edit_week(query: CallbackQuery, state: FSMContext) -> None:
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    async with async_session_maker() as session:
+        buttons = await _slot_button_rows(session, "wedit")
+    if not buttons:
+        await query.answer("Нет недельных слотов", show_alert=True)
+        return
+    await state.update_data(mode="edit_all")
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Какой слот изменить на все недели?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+
+@router.callback_query(F.data.startswith("wedit:"))
+async def cb_wedit(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    slot_id = query.data.split(":", 1)[1]
+    await state.update_data(mode="edit_all", slot_id=slot_id)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Новый день недели:",
+            reply_markup=_weekday_keyboard("wday"),
+        )
+
+
+@router.callback_query(F.data == "admin_edit_once")
+async def cb_admin_edit_once(query: CallbackQuery, state: FSMContext) -> None:
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    async with async_session_maker() as session:
+        buttons = await _slot_button_rows(session, "wonce")
+    if not buttons:
+        await query.answer("Нет недельных слотов", show_alert=True)
+        return
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Какое повторяющееся занятие изменить на одну дату?",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        )
+
+
+@router.callback_query(F.data.startswith("wonce:"))
+async def cb_wonce(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    slot_id = query.data.split(":", 1)[1]
+    await state.update_data(mode="edit_one", slot_id=slot_id)
+    await state.set_state(WeekFSM.once_date)
+    await query.answer()
+    if query.message:
+        await query.message.answer("Дата занятия (ДД-ММ-ГГГГ):")
+
+
+@router.message(WeekFSM.once_date)
+async def fsm_once_date(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     try:
-        date.fromisoformat(message.text.strip())
+        on_date = parse_dmy(message.text)
     except ValueError:
-        await message.answer("Формат: ГГГГ-ММ-ДД")
+        await message.answer("Формат: ДД-ММ-ГГГГ")
         return
-    await state.update_data(slot_date=message.text.strip())
-    await state.set_state(SlotFSM.time_str)
-    await message.answer("Время начала (ЧЧ:ММ):")
+    await state.update_data(once_date=on_date.strftime("%d-%m-%Y"))
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Перенести", callback_data="once_move")],
+            [InlineKeyboardButton(text="Отменить занятие", callback_data="once_cancel")],
+        ]
+    )
+    await message.answer(f"Занятие {on_date.strftime('%d-%m-%Y')}:", reply_markup=kb)
 
 
-@router.message(SlotFSM.time_str)
-async def fsm_slot_time(message: Message, state: FSMContext) -> None:
-    if not message.text:
+@router.callback_query(F.data == "once_cancel")
+async def cb_once_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    data = await state.get_data()
+    if query.from_user is None or "slot_id" not in data or "once_date" not in data:
+        await query.answer("Начните заново")
         return
-    if not re.match(r"^\d{1,2}:\d{2}$", message.text.strip()):
+    on_date = parse_dmy(data["once_date"])
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, query.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await query.answer(REFUSAL, show_alert=True)
+            return
+        await cancel_occurrence(session, data["slot_id"], on_date)
+        await session.commit()
+    await state.clear()
+    await query.answer("Отменено")
+    if query.message:
+        await query.message.answer(
+            f"Занятие {on_date.strftime('%d-%m-%Y')} отменено. Остальные недели без изменений."
+        )
+
+
+@router.callback_query(F.data == "once_move")
+async def cb_once_move(query: CallbackQuery, state: FSMContext) -> None:
+    await state.set_state(WeekFSM.time_str)
+    await query.answer()
+    if query.message:
+        await query.message.answer("Новое время начала (ЧЧ:ММ):")
+
+
+@router.message(WeekFSM.time_str)
+async def fsm_week_time(message: Message, state: FSMContext) -> None:
+    if not message.text or _parse_hhmm(message.text) is None:
         await message.answer("Формат: ЧЧ:ММ")
         return
     await state.update_data(slot_time=message.text.strip())
-    await state.set_state(SlotFSM.duration)
+    await state.set_state(WeekFSM.duration)
     await message.answer("Длительность в минутах:")
 
 
-@router.message(SlotFSM.duration)
-async def fsm_slot_duration(message: Message, state: FSMContext) -> None:
+@router.message(WeekFSM.duration)
+async def fsm_week_duration(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     try:
-        int(message.text.strip())
+        minutes = int(message.text.strip())
     except ValueError:
         await message.answer("Введите число минут")
         return
-    await state.update_data(slot_duration=message.text.strip())
-    await state.set_state(SlotFSM.place)
+    if minutes <= 0:
+        await message.answer("Длительность должна быть больше нуля")
+        return
+    await state.update_data(slot_duration=str(minutes))
+    await state.set_state(WeekFSM.place)
     await message.answer("Место:")
 
 
-@router.message(SlotFSM.place)
-async def fsm_slot_place(message: Message, state: FSMContext) -> None:
+@router.message(WeekFSM.place)
+async def fsm_week_place(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     await state.update_data(slot_place=message.text.strip())
-    await state.set_state(SlotFSM.bring_notes)
-    await message.answer("Что взять с собой (текст для гостей):")
+    await state.set_state(WeekFSM.notes)
+    await message.answer("Что взять с собой (или «—»):")
 
 
-@router.message(SlotFSM.bring_notes)
-async def fsm_slot_notes(message: Message, state: FSMContext) -> None:
+@router.message(WeekFSM.notes)
+async def fsm_week_notes(message: Message, state: FSMContext) -> None:
     if message.from_user is None:
         return
     data = await state.get_data()
     notes = (message.text or "—").strip()
-    tz = _school_tz()
-    d = date.fromisoformat(data["slot_date"])
-    h, m = map(int, data["slot_time"].split(":"))
-    duration = int(data["slot_duration"])
-    starts_local = datetime(d.year, d.month, d.day, h, m, tzinfo=tz)
-    ends_local = starts_local + timedelta(minutes=duration)
-    starts_utc = starts_local.astimezone(UTC)
-    ends_utc = ends_local.astimezone(UTC)
+    if notes == "—":
+        notes = ""
+    hour, minute = _parse_hhmm(data["slot_time"]) or (0, 0)
+    start = datetime.strptime(f"{hour:02d}:{minute:02d}", "%H:%M").time()
+    end_dt = datetime.combine(date.today(), start) + timedelta(
+        minutes=int(data["slot_duration"])
+    )
+    end = end_dt.time()
+    if end <= start:
+        await message.answer("Занятие переходит через полночь — укажите более короткую длительность.")
+        await state.set_state(WeekFSM.duration)
+        return
+    mode = data.get("mode", "new")
     async with async_session_maker() as session:
         admin = await _person_by_telegram(session, message.from_user.id)
         if admin is None or not _is_admin(admin):
             await message.answer(REFUSAL)
             await state.clear()
             return
-        await create_session(
-            session,
-            data["group_id"],
-            starts_utc,
-            ends_utc,
-            data["slot_place"],
-            notes,
-        )
+        if mode == "edit_one":
+            on_date = parse_dmy(data["once_date"])
+            await override_occurrence(
+                session, data["slot_id"], on_date, start, end, data["slot_place"], notes or None
+            )
+            text = f"Изменено только {on_date.strftime('%d-%m-%Y')}."
+        elif mode == "edit_all":
+            await update_weekly_slot(
+                session,
+                data["slot_id"],
+                int(data["weekday"]),
+                start,
+                end,
+                data["slot_place"],
+                notes or None,
+            )
+            text = "График изменён на все будущие недели. Уже изменённые отдельные даты не трогал."
+        else:
+            await create_weekly_slot(
+                session,
+                data["group_id"],
+                int(data["weekday"]),
+                start,
+                end,
+                data["slot_place"],
+                notes or None,
+            )
+            text = "Недельный слот создан. Отдельные даты вводить не нужно."
         await session.commit()
-    await message.answer("Слот создан.")
+    await message.answer(text)
     await state.clear()
 
 
@@ -1530,7 +1741,7 @@ async def fsm_new_price_amount(message: Message, state: FSMContext) -> None:
         return
     await state.update_data(price_amount=message.text.strip())
     await state.set_state(NewPriceFSM.valid_from)
-    await message.answer("Дата начала цены (ГГГГ-ММ-ДД):")
+    await message.answer("Дата начала цены (ДД-ММ-ГГГГ):")
 
 
 @router.message(NewPriceFSM.valid_from)
@@ -1538,9 +1749,9 @@ async def fsm_new_price_valid_from(message: Message, state: FSMContext) -> None:
     if not message.text or message.from_user is None:
         return
     try:
-        valid_from = date.fromisoformat(message.text.strip())
+        valid_from = parse_dmy(message.text.strip())
     except ValueError:
-        await message.answer("Формат: ГГГГ-ММ-ДД")
+        await message.answer("Формат: ДД-ММ-ГГГГ")
         return
     data = await state.get_data()
     amount = Decimal(data["price_amount"].replace(",", "."))
