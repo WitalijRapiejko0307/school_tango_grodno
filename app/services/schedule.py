@@ -39,6 +39,43 @@ async def create_group(
     return group
 
 
+async def set_group_stream(
+    session: AsyncSession, group_id: str, stream_id: str | None
+) -> Group:
+    group = await session.get(Group, group_id)
+    if group is None:
+        raise ValueError("group")
+    group.stream_id = stream_id
+    await session.flush()
+    return group
+
+
+async def active_group_membership(
+    session: AsyncSession, person_id: str
+) -> GroupMembership | None:
+    result = await session.execute(
+        select(GroupMembership).where(
+            GroupMembership.person_id == person_id,
+            GroupMembership.ended_on.is_(None),
+        )
+    )
+    return result.scalar_one_or_none()
+
+
+def group_transfer_confirmation_text(
+    person_full_name: str,
+    from_group_name: str,
+    member_since: date,
+    to_group_name: str,
+) -> str:
+    from app.services.school_time import format_school_date
+
+    return (
+        f"{person_full_name} уже в „{from_group_name}“ с "
+        f"{format_school_date(member_since)}. Перевести в „{to_group_name}“?"
+    )
+
+
 async def create_stream(session: AsyncSession, name: str) -> Stream:
     stream = Stream(name=name)
     session.add(stream)

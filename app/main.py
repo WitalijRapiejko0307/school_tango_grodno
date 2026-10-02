@@ -8,7 +8,8 @@ from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
 from fastapi import FastAPI, HTTPException, Request
 
-from app.channels.telegram import reminder_inline_markup, router as telegram_router
+from app.channels.tracking_bot import TrackingBot
+from app.channels.telegram import router as telegram_router, send_due_reminder
 from app.config import get_settings
 from app.db import Base, async_session_maker, engine
 from app.services.notifications import mark_sent, plan_due
@@ -29,13 +30,8 @@ async def _reminder_loop(bot: Bot) -> None:
                 for item in due_list:
                     if item.telegram_user_id is None:
                         continue
-                    markup = reminder_inline_markup(item)
                     try:
-                        await bot.send_message(
-                            item.telegram_user_id,
-                            item.text,
-                            reply_markup=markup,
-                        )
+                        await send_due_reminder(bot, item)
                         await mark_sent(
                             session,
                             item.reminder_id,
@@ -76,7 +72,7 @@ async def lifespan(app: FastAPI):
     bot: Bot | None = None
     task: asyncio.Task | None = None
     if settings.BOT_TOKEN:
-        bot = Bot(token=settings.BOT_TOKEN)
+        bot = TrackingBot(token=settings.BOT_TOKEN)
         if settings.PUBLIC_URL.strip():
             try:
                 await _register_telegram_webhook(bot, settings)

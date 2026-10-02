@@ -257,6 +257,45 @@ class DropInCharge(Base):
     )
 
 
+class ReminderResponse:
+    """Values for Reminder.response (session intent and attendance answers)."""
+
+    NONE = "none"
+    COMING = "coming"
+    DECLINED = "declined"
+    ATTENDED_YES = "attended_yes"
+    ATTENDED_NO = "attended_no"
+
+
+class GuestRsvpStatus:
+    PLANNED = "planned"
+    REMINDED = "reminded"
+    CANCELLED = "cancelled"
+
+
+class BotChatMessage(Base):
+    """Telegram message sent by the bot (for deletion rules)."""
+
+    __tablename__ = "bot_chat_messages"
+    __table_args__ = (Index("ix_bot_chat_messages_person_sent", "person_id", "sent_at"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    person_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("persons.id"), nullable=False
+    )
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    telegram_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
+    school_session_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("school_sessions.id"), nullable=True
+    )
+    is_reply_menu_anchor: Mapped[bool] = mapped_column(
+        Boolean, nullable=False, default=False
+    )
+    sent_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class Reminder(Base):
     __tablename__ = "reminders"
 

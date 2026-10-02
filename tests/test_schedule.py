@@ -5,16 +5,19 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db import Base
-from app.models import GroupMembership, Person, SchoolSession
+from app.models import Group, GroupMembership, Person, SchoolSession
 from app.services.schedule import (
     assign_group,
     create_group,
     create_session,
+    create_stream,
     create_weekly_slot,
+    group_transfer_confirmation_text,
     list_month_sessions,
     materialize_range,
     override_occurrence,
     parse_dmy,
+    set_group_stream,
     update_weekly_slot,
 )
 
@@ -30,6 +33,29 @@ async def db_session() -> AsyncSession:
     async with session_factory() as session:
         yield session
     await engine.dispose()
+
+
+def test_group_transfer_confirmation_text_uses_school_date_format() -> None:
+    text = group_transfer_confirmation_text(
+        "Иван",
+        "Начинающие",
+        date(2026, 10, 1),
+        "Продолжающие",
+    )
+    assert text == (
+        "Иван уже в „Начинающие“ с 01.10.2026. Перевести в „Продолжающие“?"
+    )
+
+
+async def test_set_group_stream_updates_group(db_session: AsyncSession) -> None:
+    stream = await create_stream(db_session, "Весна")
+    group = await create_group(db_session, "Группа 1")
+    updated = await set_group_stream(db_session, group.id, stream.id)
+    assert updated.stream_id == stream.id
+    await set_group_stream(db_session, group.id, None)
+    row = await db_session.get(Group, group.id)
+    assert row is not None
+    assert row.stream_id is None
 
 
 async def test_assign_group_closes_previous_membership_and_sets_role_client(

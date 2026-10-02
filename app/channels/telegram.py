@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
-from aiogram import F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -20,7 +20,7 @@ from aiogram.types import (
     Message,
     ReplyKeyboardMarkup,
 )
-from sqlalchemy import and_, func, select
+from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
@@ -35,6 +35,7 @@ from app.models import (
     Product,
     Reminder,
     SchoolSession,
+    Stream,
 )
 from app.services.attendance import mark_attendance
 from app.services.billing import (
@@ -50,25 +51,32 @@ from app.services.identity import (
     invite_admin,
     upsert_from_telegram,
 )
+from app.services.bot_messages import bind_outbound_school_session_id, reset_outbound_context
 from app.services.notifications import (
     DueReminder,
     answer_attendance,
+    find_today_own_session_conflict,
     guest_day_summary,
     guest_rsvp,
-    list_reminders,
+    list_today_session_reminder_lines,
     record_coming,
+    record_not_coming,
+    second_booking_prompt_text,
 )
+from app.services.school_time import format_school_date, format_school_datetime
 from app.services.schedule import (
     WEEKDAY_LABELS,
-    add_stream_member,
+    active_group_membership,
     assign_group,
     cancel_occurrence,
     create_group,
     create_stream,
     create_weekly_slot,
+    group_transfer_confirmation_text,
     materialize_range,
     override_occurrence,
     parse_dmy,
+    set_group_stream,
     update_weekly_slot,
 )
 
@@ -128,7 +136,7 @@ def _guest_keyboard_with_phone() -> ReplyKeyboardMarkup:
     )
 
 
-def _reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
+def reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
     texts = role_keyboard(role)
     if role == "admin":
         rows = [
@@ -177,11 +185,6 @@ def _school_tz() -> ZoneInfo:
 
 def _today_local() -> date:
     return datetime.now(_school_tz()).date()
-
-
-def _format_session_local(starts_at: datetime) -> str:
-    local = starts_at.astimezone(_school_tz()) if starts_at.tzinfo else starts_at
-    return local.strftime("%d.%m %H:%M")
 
 
 async def _person_by_telegram(
@@ -303,13 +306,97 @@ def _attendance_keyboard(
 async def _active_membership(
     session: AsyncSession, person_id: str
 ) -> GroupMembership | None:
-    result = await session.execute(
-        select(GroupMembership).where(
-            GroupMembership.person_id == person_id,
-            GroupMembership.ended_on.is_(None),
-        )
+    return await active_group_membership(session, person_id)
+
+
+async def _stream_pick_keyboard(
+    session: AsyncSession,
+    *,
+    mode: str,
+    group_id: str | None = None,
+) -> InlineKeyboardMarkup:
+    """mode: new_group | edit_group — callback prefixes new_grp_strm / set_grp_strm."""
+    streams = list(
+        (await session.execute(select(Stream).order_by(Stream.name))).scalars().all()
     )
-    return result.scalar_one_or_none()
+    rows: list[list[InlineKeyboardButton]] = []
+    if mode == "new_group":
+        for stream in streams:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=stream.name,
+                        callback_data=f"new_grp_strm:{stream.id}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Создать поток", callback_data="new_grp_strm:new"
+                )
+            ]
+        )
+        rows.append(
+            [InlineKeyboardButton(text="Без потока", callback_data="new_grp_strm:none")]
+        )
+    else:
+        assert group_id is not None
+        for stream in streams:
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=stream.name,
+                        callback_data=f"set_grp_strm:{group_id}:{stream.id}",
+                    )
+                ]
+            )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Создать поток",
+                    callback_data=f"set_grp_strm:{group_id}:new",
+                )
+            ]
+        )
+        rows.append(
+            [
+                InlineKeyboardButton(
+                    text="Без потока", callback_data=f"set_grp_strm:{group_id}:none"
+                )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+async def _finish_assign_group(
+    query: CallbackQuery,
+    state: FSMContext,
+    person_id: str,
+    group_id: str,
+) -> None:
+    today = _today_local()
+    notify_id: int | None = None
+    async with async_session_maker() as session:
+        target = await session.get(Person, person_id)
+        was_guest = target is not None and target.role == "guest"
+        await assign_group(session, person_id, group_id, today)
+        await session.commit()
+        if was_guest and target is not None and target.telegram_user_id is not None:
+            notify_id = target.telegram_user_id
+    await state.clear()
+    await query.answer("Готово")
+    if query.message:
+        await query.message.answer("Человек назначен в группу.")
+    if notify_id is not None:
+        try:
+            await query.bot.send_message(
+                notify_id,
+                "Вас записали в группу. Теперь вы клиент школы.",
+                reply_markup=reply_markup_for_role("client"),
+            )
+        except Exception:
+            logger.exception("Failed to refresh client menu for %s", notify_id)
 
 
 async def _format_contacts(session: AsyncSession) -> str:
@@ -367,6 +454,11 @@ class ContactFSM(StatesGroup):
 
 class NewGroupFSM(StatesGroup):
     name = State()
+    new_stream_name = State()
+
+
+class GroupStreamFSM(StatesGroup):
+    new_stream_name = State()
 
 
 class SlotFSM(StatesGroup):
@@ -388,11 +480,6 @@ class WeekFSM(StatesGroup):
     place = State()
     notes = State()
     once_date = State()
-
-
-class StreamFSM(StatesGroup):
-    name = State()
-    username = State()
 
 
 class AssignGroupFSM(StatesGroup):
@@ -436,7 +523,7 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
     person = await _ensure_person(message)
     if person is None:
         return
-    markup = _reply_markup_for_role(person.role)
+    markup = reply_markup_for_role(person.role)
     text = f"Здравствуйте, {person.full_name}!"
     if person.role == "guest":
         async with async_session_maker() as session:
@@ -473,12 +560,18 @@ async def on_contact(message: Message, state: FSMContext) -> None:
     if role == "admin":
         await message.answer(
             f"{name}, вы администратор.",
-            reply_markup=_reply_markup_for_role("admin"),
+            reply_markup=reply_markup_for_role("admin"),
+        )
+        return
+    if role == "client":
+        await message.answer(
+            f"{name}, номер сохранён.",
+            reply_markup=reply_markup_for_role("client"),
         )
         return
     await message.answer(
         "Этот номер не найден среди приглашений администраторов.",
-        reply_markup=_reply_markup_for_role("guest"),
+        reply_markup=reply_markup_for_role("guest"),
     )
 
 
@@ -500,6 +593,23 @@ async def cb_go(query: CallbackQuery) -> None:
     await query.answer()
     if query.message:
         await query.message.answer("записали, что идёте")
+
+
+@router.callback_query(F.data.startswith("nogo:"))
+async def cb_not_go(query: CallbackQuery) -> None:
+    if query.data is None or query.from_user is None:
+        return
+    session_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, query.from_user.id)
+        if person is None:
+            await query.answer("Сначала нажмите /start")
+            return
+        await record_not_coming(session, person.id, session_id, datetime.now(UTC))
+        await session.commit()
+    await query.answer()
+    if query.message:
+        await query.message.answer("приняли, что не идёте")
 
 
 @router.callback_query(F.data.startswith("att:"))
@@ -564,7 +674,7 @@ async def cb_admin_session(query: CallbackQuery) -> None:
             session, school_session.group_id, school_session_id
         )
         text = _attendance_list_text(
-            members, group_name, _format_session_local(school_session.starts_at)
+            members, group_name, format_school_datetime(school_session.starts_at)
         )
         kb = _attendance_keyboard(school_session_id, members)
     await query.answer()
@@ -606,12 +716,18 @@ async def cb_admin_toggle_att(query: CallbackQuery) -> None:
         )
         await session.commit()
         text = _attendance_list_text(
-            members, group_name, _format_session_local(school_session.starts_at)
+            members, group_name, format_school_datetime(school_session.starts_at)
         )
         kb = _attendance_keyboard(school_session_id, members)
     await query.answer()
     if query.message:
         await query.message.edit_text(text, reply_markup=kb)
+
+
+async def _complete_other_group_visit(
+    session: AsyncSession, person_id: str, target_session_id: str, now: datetime
+) -> str:
+    return await _client_mark_yes(session, person_id, target_session_id, now)
 
 
 @router.callback_query(F.data.startswith("other_sess:"))
@@ -624,13 +740,91 @@ async def cb_other_group_session(query: CallbackQuery) -> None:
         if person is None:
             await query.answer("Сначала /start")
             return
-        text = await _client_mark_yes(
+        today = _today_local()
+        conflict = await find_today_own_session_conflict(
+            session, person.id, session_id, today
+        )
+        if conflict is not None:
+            own_session, group = conflict
+            prompt = second_booking_prompt_text(group.name, own_session.starts_at)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Отменить и записаться",
+                            callback_data=(
+                                f"other_swap:{session_id}:{own_session.id}"
+                            ),
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Оставить обе",
+                            callback_data=f"other_both:{session_id}",
+                        )
+                    ],
+                    [InlineKeyboardButton(text="Назад", callback_data="other_back")],
+                ]
+            )
+            await query.answer()
+            if query.message:
+                await query.message.answer(prompt, reply_markup=kb)
+            return
+        text = await _complete_other_group_visit(
             session, person.id, session_id, datetime.now(UTC)
         )
         await session.commit()
     await query.answer()
     if query.message:
         await query.message.answer(text)
+
+
+@router.callback_query(F.data.startswith("other_swap:"))
+async def cb_other_group_swap(query: CallbackQuery) -> None:
+    if query.data is None or query.from_user is None:
+        return
+    parts = query.data.split(":")
+    if len(parts) != 3:
+        return
+    _, target_id, own_id = parts
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, query.from_user.id)
+        if person is None:
+            await query.answer("Сначала /start")
+            return
+        now = datetime.now(UTC)
+        await record_not_coming(session, person.id, own_id, now)
+        text = await _complete_other_group_visit(
+            session, person.id, target_id, now
+        )
+        await session.commit()
+    await query.answer()
+    if query.message:
+        await query.message.answer(text)
+
+
+@router.callback_query(F.data.startswith("other_both:"))
+async def cb_other_group_both(query: CallbackQuery) -> None:
+    if query.data is None or query.from_user is None:
+        return
+    target_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, query.from_user.id)
+        if person is None:
+            await query.answer("Сначала /start")
+            return
+        text = await _complete_other_group_visit(
+            session, person.id, target_id, datetime.now(UTC)
+        )
+        await session.commit()
+    await query.answer()
+    if query.message:
+        await query.message.answer(text)
+
+
+@router.callback_query(F.data == "other_back")
+async def cb_other_group_back(query: CallbackQuery) -> None:
+    await query.answer("Отменено")
 
 
 # --- Inline pick helpers (groups, products, people) ---
@@ -697,28 +891,66 @@ async def cb_assign_group(query: CallbackQuery, state: FSMContext) -> None:
     if admin is None or not _is_admin(admin):
         await query.answer(REFUSAL, show_alert=True)
         return
-    today = _today_local()
-    notify_id: int | None = None
     async with async_session_maker() as session:
         target = await session.get(Person, person_id)
-        was_guest = target is not None and target.role == "guest"
-        await assign_group(session, person_id, group_id, today)
-        await session.commit()
-        if was_guest and target is not None and target.telegram_user_id is not None:
-            notify_id = target.telegram_user_id
-    await state.clear()
-    await query.answer("Готово")
-    if query.message:
-        await query.message.answer("Человек назначен в группу.")
-    if notify_id is not None:
-        try:
-            await query.bot.send_message(
-                notify_id,
-                "Вас записали в группу. Теперь вы клиент школы.",
-                reply_markup=_reply_markup_for_role("client"),
+        new_group = await session.get(Group, group_id)
+        if target is None or new_group is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        membership = await _active_membership(session, person_id)
+        if membership is not None and membership.group_id == group_id:
+            await query.answer("Уже в этой группе", show_alert=True)
+            return
+        if membership is not None:
+            old_group = await session.get(Group, membership.group_id)
+            if old_group is None:
+                await query.answer("Ошибка", show_alert=True)
+                return
+            text = group_transfer_confirmation_text(
+                target.full_name,
+                old_group.name,
+                membership.started_on,
+                new_group.name,
             )
-        except Exception:
-            logger.exception("Failed to refresh client menu for %s", notify_id)
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Перевести",
+                            callback_data=f"assign_go:{person_id}:{group_id}",
+                        )
+                    ],
+                    [InlineKeyboardButton(text="Отмена", callback_data="assign_cancel")],
+                ]
+            )
+            await query.answer()
+            if query.message:
+                await query.message.answer(text, reply_markup=kb)
+            return
+    await _finish_assign_group(query, state, person_id, group_id)
+
+
+@router.callback_query(F.data.startswith("assign_go:"))
+async def cb_assign_group_confirm(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    _, person_id, group_id = query.data.split(":", 2)
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    await _finish_assign_group(query, state, person_id, group_id)
+
+
+@router.callback_query(F.data == "assign_cancel")
+async def cb_assign_group_cancel(query: CallbackQuery) -> None:
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    await query.answer("Отменено")
+    if query.message:
+        await query.message.answer("Перевод в другую группу отменён.")
 
 
 @router.callback_query(F.data.startswith("open_sub_p:"))
@@ -830,18 +1062,6 @@ async def cb_admin_slot(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
     if query.message:
         await query.message.answer("Выберите группу для слота:", reply_markup=kb)
-
-
-@router.callback_query(F.data == "people_stream")
-async def cb_people_stream(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
-        return
-    await state.set_state(StreamFSM.name)
-    await query.answer()
-    if query.message:
-        await query.message.answer("Название потока:")
 
 
 @router.callback_query(F.data == "people_assign")
@@ -999,7 +1219,7 @@ async def menu_today(message: Message) -> None:
         buttons = []
         for s in sessions:
             gname = await _session_group_name(session, s.group_id)
-            lines.append(f"• {gname} — {_format_session_local(s.starts_at)}, {s.place}")
+            lines.append(f"• {gname} — {format_school_datetime(s.starts_at)}, {s.place}")
             buttons.append(
                 [
                     InlineKeyboardButton(
@@ -1025,6 +1245,11 @@ async def menu_groups(message: Message) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="Новая группа", callback_data="admin_new_group")],
+            [
+                InlineKeyboardButton(
+                    text="Поток группы", callback_data="admin_group_stream"
+                )
+            ],
             [InlineKeyboardButton(text="Недельный слот", callback_data="admin_slot")],
             [InlineKeyboardButton(text="Изменить график", callback_data="admin_edit_week")],
             [InlineKeyboardButton(text="Одно занятие", callback_data="admin_edit_once")],
@@ -1042,7 +1267,6 @@ async def menu_people(message: Message) -> None:
             return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Поток", callback_data="people_stream")],
             [InlineKeyboardButton(text="В группу", callback_data="people_assign")],
         ]
     )
@@ -1094,14 +1318,11 @@ async def menu_reminders(message: Message) -> None:
         if person is None or not _is_admin(person):
             await message.answer(REFUSAL if person and not _is_admin(person) else "")
             return
-        reminders = await list_reminders(session, limit=15)
-        if not reminders:
-            await message.answer("Напоминаний пока нет.")
+        today = _today_local()
+        lines = await list_today_session_reminder_lines(session, today)
+        if not lines:
+            await message.answer("На сегодня реакций на напоминания пока нет.")
             return
-        lines = []
-        for r in reminders:
-            sent = r.sent_at.isoformat() if r.sent_at else "—"
-            lines.append(f"{r.kind} | {sent} | ответ: {r.response}")
         await message.answer("\n".join(lines))
 
 
@@ -1122,7 +1343,7 @@ async def menu_guests_summary(message: Message) -> None:
             phone = guest.phone or "—"
             lines.append(
                 f"• {guest.full_name} ({phone}) — "
-                f"{_format_session_local(school_session.starts_at)}, {school_session.place}"
+                f"{format_school_datetime(school_session.starts_at)}, {school_session.place}"
             )
         await message.answer("\n".join(lines))
 
@@ -1173,7 +1394,7 @@ async def menu_my_group(message: Message) -> None:
         nxt = next_result.scalar_one_or_none()
         if nxt:
             await message.answer(
-                f"Группа: {gname}\nБлижайшее: {_format_session_local(nxt.starts_at)}, {nxt.place}"
+                f"Группа: {gname}\nБлижайшее: {format_school_datetime(nxt.starts_at)}, {nxt.place}"
             )
         else:
             await message.answer(f"Группа: {gname}\nБлижайших занятий нет.")
@@ -1191,7 +1412,7 @@ async def menu_balance(message: Message) -> None:
             await message.answer("нет абонемента")
         else:
             await message.answer(
-                f"Осталось занятий: {sub.lessons_left}, действует до {sub.valid_until}"
+                f"Осталось занятий: {sub.lessons_left}, действует до {format_school_date(sub.valid_until)}"
             )
 
 
@@ -1216,7 +1437,7 @@ async def menu_other_group(message: Message) -> None:
             buttons.append(
                 [
                     InlineKeyboardButton(
-                        text=f"{gname} {_format_session_local(s.starts_at)}",
+                        text=f"{gname} {format_school_datetime(s.starts_at)}",
                         callback_data=f"other_sess:{s.id}",
                     )
                 ]
@@ -1266,7 +1487,7 @@ async def menu_schedule(message: Message, state: FSMContext) -> None:
         choices: dict[str, str] = {}
         for index, school_session in enumerate(sessions, start=1):
             gname = await _session_group_name(session, school_session.group_id)
-            local_t = _format_session_local(school_session.starts_at)
+            local_t = format_school_datetime(school_session.starts_at)
             lines.append(f"{index}. {local_t} — {gname}, {school_session.place}")
             choices[str(index)] = school_session.id
         await state.set_state(GuestPickFSM.number)
@@ -1296,7 +1517,7 @@ async def fsm_guest_pick(message: Message, state: FSMContext) -> None:
         when = ""
         if school_session is not None:
             gname = await _session_group_name(session, school_session.group_id)
-            when = _format_session_local(school_session.starts_at)
+            when = format_school_datetime(school_session.starts_at)
         await session.commit()
     await state.clear()
     await message.answer(f"Вы записаны: {when}, {gname}.")
@@ -1385,10 +1606,181 @@ async def fsm_new_group(message: Message, state: FSMContext) -> None:
             await message.answer(REFUSAL)
             await state.clear()
             return
-        group = await create_group(session, message.text.strip())
+        await state.update_data(pending_group_name=message.text.strip())
+        kb = await _stream_pick_keyboard(session, mode="new_group")
+    await message.answer("Выберите поток для группы:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("new_grp_strm:"))
+async def cb_new_group_stream(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    choice = query.data.split(":", 1)[1]
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    data = await state.get_data()
+    group_name = data.get("pending_group_name")
+    if not group_name:
+        await query.answer("Сначала введите название группы", show_alert=True)
+        return
+    if choice == "new":
+        await state.set_state(NewGroupFSM.new_stream_name)
+        await query.answer()
+        if query.message:
+            await query.message.answer("Название нового потока:")
+        return
+    stream_id: str | None = None if choice == "none" else choice
+    async with async_session_maker() as session:
+        group = await create_group(session, group_name, stream_id=stream_id)
         await session.commit()
-        await message.answer(f"Группа «{group.name}» создана.")
+        stream_note = ""
+        if stream_id:
+            stream = await session.get(Stream, stream_id)
+            if stream is not None:
+                stream_note = f", поток «{stream.name}»"
     await state.clear()
+    await query.answer("Создано")
+    if query.message:
+        await query.message.answer(f"Группа «{group.name}» создана{stream_note}.")
+
+
+@router.callback_query(F.data == "admin_group_stream")
+async def cb_admin_group_stream(query: CallbackQuery) -> None:
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    async with async_session_maker() as session:
+        groups = list(
+            (await session.execute(select(Group).order_by(Group.name))).scalars().all()
+        )
+    if not groups:
+        await query.answer("Сначала создайте группу", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=g.name, callback_data=f"pick_grp_strm:{g.id}"
+                )
+            ]
+            for g in groups
+        ]
+    )
+    await query.answer()
+    if query.message:
+        await query.message.answer("Выберите группу для потока:", reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("pick_grp_strm:"))
+async def cb_pick_group_stream(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        kb = await _stream_pick_keyboard(session, mode="edit_group", group_id=group_id)
+    await state.update_data(edit_group_id=group_id)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            f"Поток для группы «{group.name}»:", reply_markup=kb
+        )
+
+
+@router.callback_query(F.data.startswith("set_grp_strm:"))
+async def cb_set_group_stream(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    parts = query.data.split(":", 2)
+    if len(parts) != 3:
+        return
+    _, group_id, choice = parts
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    if choice == "new":
+        await state.set_state(GroupStreamFSM.new_stream_name)
+        await state.update_data(edit_group_id=group_id)
+        await query.answer()
+        if query.message:
+            await query.message.answer("Название нового потока:")
+        return
+    stream_id: str | None = None if choice == "none" else choice
+    async with async_session_maker() as session:
+        group = await set_group_stream(session, group_id, stream_id)
+        await session.commit()
+        if stream_id:
+            stream = await session.get(Stream, stream_id)
+            stream_label = f"«{stream.name}»" if stream else "выбран"
+        else:
+            stream_label = "не задан"
+    await state.clear()
+    await query.answer("Сохранено")
+    if query.message:
+        await query.message.answer(
+            f"Для группы «{group.name}» поток {stream_label}."
+        )
+
+
+@router.message(NewGroupFSM.new_stream_name)
+async def fsm_new_group_stream_name(message: Message, state: FSMContext) -> None:
+    if not message.text or message.from_user is None:
+        return
+    data = await state.get_data()
+    group_name = data.get("pending_group_name")
+    if not group_name:
+        await message.answer("Сначала создайте группу через «Новая группа».")
+        await state.clear()
+        return
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, message.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await message.answer(REFUSAL)
+            await state.clear()
+            return
+        stream = await create_stream(session, message.text.strip())
+        group = await create_group(session, group_name, stream_id=stream.id)
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        f"Группа «{group.name}» создана, поток «{stream.name}»."
+    )
+
+
+@router.message(GroupStreamFSM.new_stream_name)
+async def fsm_edit_group_stream_name(message: Message, state: FSMContext) -> None:
+    if not message.text or message.from_user is None:
+        return
+    data = await state.get_data()
+    group_id = data.get("edit_group_id")
+    if not group_id:
+        await message.answer("Сначала выберите группу.")
+        await state.clear()
+        return
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, message.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await message.answer(REFUSAL)
+            await state.clear()
+            return
+        stream = await create_stream(session, message.text.strip())
+        group = await set_group_stream(session, group_id, stream.id)
+        await session.commit()
+    await state.clear()
+    await message.answer(
+        f"Для группы «{group.name}» задан поток «{stream.name}»."
+    )
 
 
 async def _slot_button_rows(session: AsyncSession, prefix: str) -> list[list[InlineKeyboardButton]]:
@@ -1507,7 +1899,7 @@ async def fsm_once_date(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="Отменить занятие", callback_data="once_cancel")],
         ]
     )
-    await message.answer(f"Занятие {on_date.strftime('%d-%m-%Y')}:", reply_markup=kb)
+    await message.answer(f"Занятие {format_school_date(on_date)}:", reply_markup=kb)
 
 
 @router.callback_query(F.data == "once_cancel")
@@ -1528,7 +1920,7 @@ async def cb_once_cancel(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer("Отменено")
     if query.message:
         await query.message.answer(
-            f"Занятие {on_date.strftime('%d-%m-%Y')} отменено. Остальные недели без изменений."
+            f"Занятие {format_school_date(on_date)} отменено. Остальные недели без изменений."
         )
 
 
@@ -1606,7 +1998,7 @@ async def fsm_week_notes(message: Message, state: FSMContext) -> None:
             await override_occurrence(
                 session, data["slot_id"], on_date, start, end, data["slot_place"], notes or None
             )
-            text = f"Изменено только {on_date.strftime('%d-%m-%Y')}."
+            text = f"Изменено только {format_school_date(on_date)}."
         elif mode == "edit_all":
             await update_weekly_slot(
                 session,
@@ -1631,43 +2023,6 @@ async def fsm_week_notes(message: Message, state: FSMContext) -> None:
             text = "Недельный слот создан. Отдельные даты вводить не нужно."
         await session.commit()
     await message.answer(text)
-    await state.clear()
-
-
-@router.message(StreamFSM.name)
-async def fsm_stream_name(message: Message, state: FSMContext) -> None:
-    if not message.text:
-        return
-    await state.update_data(stream_name=message.text.strip())
-    await state.set_state(StreamFSM.username)
-    await message.answer("Username человека (@ник) для добавления в поток:")
-
-
-@router.message(StreamFSM.username)
-async def fsm_stream_username(message: Message, state: FSMContext) -> None:
-    if not message.text or message.from_user is None:
-        return
-    norm = message.text.strip().lstrip("@").lower()
-    data = await state.get_data()
-    async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
-            await state.clear()
-            return
-        stream = await create_stream(session, data["stream_name"])
-        result = await session.execute(
-            select(Person).where(
-                func.lower(func.ltrim(Person.username, "@")) == norm
-            )
-        )
-        target = result.scalar_one_or_none()
-        if target is None:
-            await message.answer("Человек с таким username не найден. Поток создан без участника.")
-        else:
-            await add_stream_member(session, stream.id, target.id)
-            await message.answer(f"В поток добавлен: {target.full_name}")
-        await session.commit()
     await state.clear()
 
 
@@ -1819,11 +2174,55 @@ def reminder_inline_markup(item: DueReminder) -> InlineKeyboardMarkup | None:
                 ]
             ]
         )
-    if item.kind == "session_start" and item.school_session_id:
+    if item.kind in ("session_start", "guest_day_of") and item.school_session_id:
         sid = item.school_session_id
         return InlineKeyboardMarkup(
             inline_keyboard=[
-                [InlineKeyboardButton(text="Иду", callback_data=f"go:{sid}")]
+                [
+                    InlineKeyboardButton(text="Иду", callback_data=f"go:{sid}"),
+                    InlineKeyboardButton(text="Не иду", callback_data=f"nogo:{sid}"),
+                ]
             ]
         )
     return None
+
+
+def reminder_reply_keyboard(item: DueReminder) -> ReplyKeyboardMarkup | None:
+    """Client bottom menu on session reminders when enrollment message may have failed."""
+    if item.kind == "session_start" and item.person_role == "client":
+        return reply_markup_for_role("client")
+    return None
+
+
+async def send_due_reminder(bot: Bot, item: DueReminder) -> None:
+    """Send a planned reminder; inline and reply keyboards are attached per Telegram rules."""
+    if item.telegram_user_id is None:
+        return
+    inline = reminder_inline_markup(item)
+    reply_kb = reminder_reply_keyboard(item)
+    chat_id = item.telegram_user_id
+    sid = item.school_session_id
+    if inline is not None:
+        token = bind_outbound_school_session_id(sid)
+        try:
+            await bot.send_message(chat_id, item.text, reply_markup=inline)
+        finally:
+            reset_outbound_context(token)
+        if reply_kb is not None:
+            token = bind_outbound_school_session_id(None)
+            try:
+                await bot.send_message(chat_id, "\u2060", reply_markup=reply_kb)
+            finally:
+                reset_outbound_context(token)
+    elif reply_kb is not None:
+        token = bind_outbound_school_session_id(sid)
+        try:
+            await bot.send_message(chat_id, item.text, reply_markup=reply_kb)
+        finally:
+            reset_outbound_context(token)
+    else:
+        token = bind_outbound_school_session_id(sid)
+        try:
+            await bot.send_message(chat_id, item.text)
+        finally:
+            reset_outbound_context(token)

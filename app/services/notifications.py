@@ -17,14 +17,18 @@ from app.models import (
     Group,
     GroupMembership,
     GuestRsvp,
+    GuestRsvpStatus,
     Person,
     Reminder,
+    ReminderResponse,
     SchoolSession,
     Subscription,
 )
 from app.services.attendance import mark_attendance
+from app.services.school_time import format_school_datetime, format_school_time
 
 START_LEAD_HOURS = 3
+ADMIN_SUMMARY_LEAD_HOURS = 1
 NUDGE_AFTER_HOURS = 2
 GUEST_MORNING_HOUR = 9
 
@@ -34,6 +38,7 @@ class DueReminder:
     reminder_id: str
     person_id: str
     telegram_user_id: int | None
+    person_role: str
     kind: str
     text: str
     school_session_id: str | None
@@ -55,11 +60,6 @@ def _to_local(dt: datetime) -> datetime:
 
 def _naive_local(dt: datetime) -> datetime:
     return _to_local(dt).replace(tzinfo=None)
-
-
-def _format_local_time(dt: datetime) -> str:
-    local = _to_local(dt)
-    return local.strftime("%d.%m.%Y %H:%M")
 
 
 def _local_date(dt: datetime) -> date:
@@ -137,10 +137,27 @@ def _due_from_reminder(
         reminder_id=reminder.id,
         person_id=reminder.person_id,
         telegram_user_id=person.telegram_user_id,
+        person_role=person.role,
         kind=kind or reminder.kind,
         text=text,
         school_session_id=reminder.session_id,
     )
+
+
+async def _cancel_guest_rsvp(
+    session: AsyncSession,
+    person_id: str,
+    school_session_id: str,
+) -> None:
+    result = await session.execute(
+        select(GuestRsvp).where(
+            GuestRsvp.person_id == person_id,
+            GuestRsvp.session_id == school_session_id,
+        )
+    )
+    rsvp = result.scalar_one_or_none()
+    if rsvp is not None:
+        rsvp.status = GuestRsvpStatus.CANCELLED
 
 
 async def record_coming(
@@ -149,6 +166,19 @@ async def record_coming(
     school_session_id: str,
     now: datetime,
 ) -> Reminder:
+    guest_reminder = await _find_reminder(
+        session,
+        person_id,
+        "guest_day_of",
+        session_id=school_session_id,
+    )
+    if guest_reminder is not None:
+        guest_reminder.response = ReminderResponse.COMING
+        if guest_reminder.sent_at is None:
+            guest_reminder.sent_at = now
+        await session.flush()
+        return guest_reminder
+
     reminder = await _find_reminder(
         session,
         person_id,
@@ -162,7 +192,47 @@ async def record_coming(
             session_id=school_session_id,
         )
         session.add(reminder)
-    reminder.response = "coming"
+    reminder.response = ReminderResponse.COMING
+    if reminder.sent_at is None:
+        reminder.sent_at = now
+    await session.flush()
+    return reminder
+
+
+async def record_not_coming(
+    session: AsyncSession,
+    person_id: str,
+    school_session_id: str,
+    now: datetime,
+) -> Reminder:
+    guest_reminder = await _find_reminder(
+        session,
+        person_id,
+        "guest_day_of",
+        session_id=school_session_id,
+    )
+    if guest_reminder is not None:
+        guest_reminder.response = ReminderResponse.DECLINED
+        if guest_reminder.sent_at is None:
+            guest_reminder.sent_at = now
+        await _cancel_guest_rsvp(session, person_id, school_session_id)
+        await session.flush()
+        return guest_reminder
+
+    reminder = await _find_reminder(
+        session,
+        person_id,
+        "session_start",
+        session_id=school_session_id,
+    )
+    if reminder is None:
+        reminder = Reminder(
+            person_id=person_id,
+            kind="session_start",
+            session_id=school_session_id,
+        )
+        session.add(reminder)
+    reminder.response = ReminderResponse.DECLINED
     if reminder.sent_at is None:
         reminder.sent_at = now
     await session.flush()
@@ -184,7 +254,8 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
         .join(Group, SchoolSession.group_id == Group.id)
         .where(SchoolSession.status == "scheduled")
     )
-    for school_session, group in sessions_result.all():
+    scheduled_sessions = list(sessions_result.all())
+    for school_session, group in scheduled_sessions:
         starts_at = _as_aware(school_session.starts_at)
         if now < starts_at - lead or now >= starts_at:
             continue
@@ -213,7 +284,7 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
                 continue
             person, _ = await _person_telegram(session, membership.person_id)
             text = (
-                f"Занятие группы «{group.name}»: {_format_local_time(school_session.starts_at)}, "
+                f"Занятие группы «{group.name}»: {format_school_datetime(school_session.starts_at)}, "
                 f"место — {school_session.place}."
             )
             due.append(_due_from_reminder(reminder, person, text))
@@ -223,7 +294,7 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
         .join(SchoolSession, Reminder.session_id == SchoolSession.id)
         .where(
             Reminder.kind == "session_start",
-            Reminder.response == "coming",
+            Reminder.response == ReminderResponse.COMING,
         )
     )
     for start_reminder, school_session in coming_result.all():
@@ -257,7 +328,7 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
             Reminder.kind == "attendance_ask",
             Reminder.sent_at.is_not(None),
             Reminder.nudge_sent_at.is_(None),
-            Reminder.response.in_(("none",)),
+            Reminder.response.in_((ReminderResponse.NONE,)),
         )
     )
     for ask in nudge_result.scalars().all():
@@ -372,7 +443,7 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
         select(GuestRsvp, SchoolSession)
         .join(SchoolSession, GuestRsvp.session_id == SchoolSession.id)
         .where(
-            GuestRsvp.status == "planned",
+            GuestRsvp.status == GuestRsvpStatus.PLANNED,
             SchoolSession.status == "scheduled",
         )
     )
@@ -400,10 +471,43 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
         person, _ = await _person_telegram(session, rsvp.person_id)
         notes = school_session.bring_notes or "—"
         text = (
-            f"Сегодня занятие в {_format_local_time(school_session.starts_at)}. "
+            f"Сегодня занятие в {format_school_datetime(school_session.starts_at)}. "
             f"Место: {school_session.place}. Что взять: {notes}."
         )
         due.append(_due_from_reminder(reminder, person, text))
+
+    summary_lead = timedelta(hours=ADMIN_SUMMARY_LEAD_HOURS)
+    for school_session, group in scheduled_sessions:
+        starts_at = _as_aware(school_session.starts_at)
+        if now < starts_at - summary_lead or now >= starts_at:
+            continue
+        summary_text = await build_admin_session_summary_text(
+            session, school_session, group
+        )
+        admins_result = await session.execute(
+            select(Person).where(
+                Person.role == "admin",
+                Person.telegram_user_id.is_not(None),
+            )
+        )
+        for admin in admins_result.scalars().all():
+            reminder = await _find_reminder(
+                session,
+                admin.id,
+                "admin_session_summary",
+                session_id=school_session.id,
+            )
+            if reminder is None:
+                reminder = Reminder(
+                    person_id=admin.id,
+                    kind="admin_session_summary",
+                    session_id=school_session.id,
+                )
+                session.add(reminder)
+                await session.flush()
+            if reminder.sent_at is not None:
+                continue
+            due.append(_due_from_reminder(reminder, admin, summary_text))
 
     return due
 
@@ -467,7 +571,7 @@ async def mark_sent(
         )
         rsvp = rsvp_result.scalar_one_or_none()
         if rsvp is not None:
-            rsvp.status = "reminded"
+            rsvp.status = GuestRsvpStatus.REMINDED
     await session.flush()
 
 
@@ -488,7 +592,7 @@ async def answer_attendance(
         raise ValueError("attendance_ask reminder not found")
 
     if not yes:
-        reminder.response = "attended_no"
+        reminder.response = ReminderResponse.ATTENDED_NO
         await session.flush()
         return "Занятие не списываем."
 
@@ -502,12 +606,12 @@ async def answer_attendance(
     )
     existing = att_before.scalar_one_or_none()
     if existing is not None and existing.source == "admin":
-        reminder.response = "attended_yes"
+        reminder.response = ReminderResponse.ATTENDED_YES
         await session.flush()
         return "Уже отмечено администратором."
 
     await mark_attendance(session, person_id, school_session_id, "client")
-    reminder.response = "attended_yes"
+    reminder.response = ReminderResponse.ATTENDED_YES
     await session.flush()
     return "Отметили по вашему ответу."
 
@@ -529,18 +633,172 @@ async def guest_rsvp(
     rsvp = GuestRsvp(
         person_id=person_id,
         session_id=school_session_id,
-        status="planned",
+        status=GuestRsvpStatus.PLANNED,
     )
     session.add(rsvp)
     await session.flush()
     return rsvp
 
 
-async def list_reminders(session: AsyncSession, limit: int = 30) -> list[Reminder]:
-    result = await session.execute(
-        select(Reminder).order_by(Reminder.created_at.desc()).limit(limit)
+def _guest_summary_line(person: Person) -> str:
+    if person.username:
+        return f"@{person.username}"
+    phone = person.phone or "—"
+    return f"{person.full_name}, {phone}"
+
+
+async def build_admin_session_summary_text(
+    session: AsyncSession,
+    school_session: SchoolSession,
+    group: Group,
+) -> str:
+    coming = declined = silent = 0
+    memberships = await session.execute(
+        select(GroupMembership).where(
+            GroupMembership.group_id == school_session.group_id,
+            GroupMembership.ended_on.is_(None),
+        )
     )
-    return list(result.scalars().all())
+    for membership in memberships.scalars().all():
+        reminder = await _find_reminder(
+            session,
+            membership.person_id,
+            "session_start",
+            session_id=school_session.id,
+        )
+        response = reminder.response if reminder is not None else ReminderResponse.NONE
+        if response == ReminderResponse.COMING:
+            coming += 1
+        elif response == ReminderResponse.DECLINED:
+            declined += 1
+        else:
+            silent += 1
+
+    guest_lines: list[str] = []
+    rsvp_result = await session.execute(
+        select(GuestRsvp, Person)
+        .join(Person, GuestRsvp.person_id == Person.id)
+        .where(
+            GuestRsvp.session_id == school_session.id,
+            GuestRsvp.status != GuestRsvpStatus.CANCELLED,
+        )
+        .order_by(Person.full_name)
+    )
+    for _, guest in rsvp_result.all():
+        guest_lines.append(_guest_summary_line(guest))
+
+    when = format_school_datetime(school_session.starts_at)
+    lines = [
+        "Сводка за час до занятия",
+        f"Группа «{group.name}», {when}",
+        (
+            f"Клиенты: идут — {coming}, не идут — {declined}, "
+            f"не ответили — {silent}"
+        ),
+    ]
+    if guest_lines:
+        lines.append("Гости:")
+        lines.extend(guest_lines)
+    return "\n".join(lines)
+
+
+async def find_today_own_session_conflict(
+    session: AsyncSession,
+    person_id: str,
+    target_session_id: str,
+    today: date,
+) -> tuple[SchoolSession, Group] | None:
+    """Home-group session today with «Иду» or unanswered reminder, other than target."""
+    membership_result = await session.execute(
+        select(GroupMembership).where(
+            GroupMembership.person_id == person_id,
+            GroupMembership.ended_on.is_(None),
+        )
+    )
+    membership = membership_result.scalar_one_or_none()
+    if membership is None:
+        return None
+
+    tz = _school_tz()
+    day_start = datetime(today.year, today.month, today.day, tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    own_result = await session.execute(
+        select(SchoolSession, Group)
+        .join(Group, SchoolSession.group_id == Group.id)
+        .where(
+            SchoolSession.group_id == membership.group_id,
+            SchoolSession.status == "scheduled",
+            SchoolSession.starts_at >= day_start,
+            SchoolSession.starts_at < day_end,
+        )
+        .order_by(SchoolSession.starts_at)
+    )
+    row = own_result.first()
+    if row is None:
+        return None
+    own_session, group = row
+    if own_session.id == target_session_id:
+        return None
+
+    reminder = await _find_reminder(
+        session,
+        person_id,
+        "session_start",
+        session_id=own_session.id,
+    )
+    if reminder is None:
+        return None
+    if reminder.response == ReminderResponse.COMING:
+        return own_session, group
+    if reminder.response == ReminderResponse.NONE and reminder.sent_at is not None:
+        return own_session, group
+    return None
+
+
+def second_booking_prompt_text(group_name: str, starts_at: datetime) -> str:
+    return (
+        f"Сегодня вы уже идёте на „{group_name}“ в {format_school_time(starts_at)}. "
+        f"Отменить её и записаться сюда?"
+    )
+
+
+async def list_today_session_reminder_lines(
+    session: AsyncSession,
+    day: date,
+) -> list[str]:
+    """Admin-facing lines for session reminder reactions on ``day`` (school calendar)."""
+    tz = _school_tz()
+    day_start = datetime(day.year, day.month, day.day, tzinfo=tz)
+    day_end = day_start + timedelta(days=1)
+    result = await session.execute(
+        select(Reminder, Person, SchoolSession, Group)
+        .join(Person, Reminder.person_id == Person.id)
+        .join(SchoolSession, Reminder.session_id == SchoolSession.id)
+        .join(Group, SchoolSession.group_id == Group.id)
+        .where(
+            Reminder.kind.in_(("session_start", "guest_day_of")),
+            Reminder.session_id.is_not(None),
+            SchoolSession.starts_at >= day_start,
+            SchoolSession.starts_at < day_end,
+        )
+        .order_by(SchoolSession.starts_at, Person.full_name)
+    )
+    lines: list[str] = []
+    for reminder, person, school_session, group in result.all():
+        status = _reminder_status_ru(reminder.response)
+        when = format_school_datetime(school_session.starts_at)
+        lines.append(
+            f"{person.full_name} — {status}, группа «{group.name}», {when}"
+        )
+    return lines
+
+
+def _reminder_status_ru(response: str) -> str:
+    if response == ReminderResponse.COMING:
+        return "идёт"
+    if response == ReminderResponse.DECLINED:
+        return "не идёт"
+    return "не ответил"
 
 
 async def guest_day_summary(
@@ -557,6 +815,7 @@ async def guest_day_summary(
         .where(
             SchoolSession.starts_at >= day_start,
             SchoolSession.starts_at < day_end,
+            GuestRsvp.status != GuestRsvpStatus.CANCELLED,
         )
         .order_by(SchoolSession.starts_at)
     )
