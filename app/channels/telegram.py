@@ -824,7 +824,10 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
                 ]
             ]
         )
-        await message.answer("Вы уже записаны на занятия?", reply_markup=enroll_kb)
+        await message.answer(
+            "Вы уже записаны на занятия или знаете, когда у вас занятие?",
+            reply_markup=enroll_kb,
+        )
         return
     await message.answer(text, reply_markup=markup)
 
