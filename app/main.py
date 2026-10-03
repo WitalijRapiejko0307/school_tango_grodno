@@ -7,6 +7,7 @@ from aiogram import Bot, Dispatcher
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import Update
 from fastapi import FastAPI, HTTPException, Request
+from sqlalchemy import text
 
 from app.channels.tracking_bot import TrackingBot
 from app.channels.telegram import router as telegram_router, send_due_reminder
@@ -68,6 +69,41 @@ async def lifespan(app: FastAPI):
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # create_all does not add columns to tables that already exist.
+        await conn.execute(
+            text(
+                "ALTER TABLE persons ADD COLUMN IF NOT EXISTS "
+                "name_key VARCHAR(255)"
+            )
+        )
+        await conn.execute(
+            text(
+                "CREATE INDEX IF NOT EXISTS ix_persons_name_key "
+                "ON persons (name_key)"
+            )
+        )
+        dialect = conn.engine.dialect.name
+        if dialect == "postgresql":
+            has_alembic = await conn.execute(
+                text(
+                    "SELECT 1 FROM information_schema.tables "
+                    "WHERE table_name = 'alembic_version'"
+                )
+            )
+        else:
+            has_alembic = await conn.execute(
+                text(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'alembic_version'"
+                )
+            )
+        if has_alembic.first() is not None:
+            await conn.execute(
+                text(
+                    "UPDATE alembic_version SET version_num = 'b7c8d9e0f1a2' "
+                    "WHERE version_num = 'a1b2c3d4e5f6'"
+                )
+            )
 
     bot: Bot | None = None
     task: asyncio.Task | None = None
