@@ -172,6 +172,15 @@ async def test_claim_sets_telegram_id(db_session: AsyncSession) -> None:
         )
 
 
+def test_local_ocr_line_keeps_letters_and_inner_hyphen() -> None:
+    from app.services.ocr import clean_local_ocr_line
+
+    assert clean_local_ocr_line("'|, Рапейко Виталий.") == "Рапейко Виталий"
+    assert clean_local_ocr_line("12. Гулецкий Вячеслав,") == "Гулецкий Вячеслав"
+    assert clean_local_ocr_line("Петров—Водкин Кузьма") == "Петров-Водкин Кузьма"
+    assert clean_local_ocr_line("| _") == ""
+
+
 def test_numbered_lines_replace_draft_rows_instead_of_new_list() -> None:
     from app.channels.telegram import _apply_roster_replacements, _parse_lines_to_draft_dicts
 

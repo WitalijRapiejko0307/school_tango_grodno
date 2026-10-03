@@ -7,6 +7,7 @@ Otherwise reads the image locally with Tesseract (rus+eng).
 import asyncio
 import base64
 import io
+import re
 
 import httpx
 
@@ -18,13 +19,35 @@ _ROSTER_PROMPT = (
 )
 
 
+_HYPHEN_CHARS = str.maketrans({"—": "-", "–": "-", "−": "-", "‐": "-"})
+
+
+def clean_local_ocr_line(line: str) -> str:
+    """Keep letters, spaces, and a hyphen between letters (double surnames)."""
+    line = line.translate(_HYPHEN_CHARS)
+    chars: list[str] = []
+    for char in line:
+        if char.isalpha() or char == "-" or char.isspace():
+            chars.append(char)
+        else:
+            chars.append(" ")
+    line = re.sub(r"\s+", " ", "".join(chars)).strip()
+    line = re.sub(r"(?<!\w)-+|-+(?!\w)", "", line)
+    return re.sub(r"\s+", " ", line).strip()
+
+
 def _tesseract_lines(image_bytes: bytes) -> list[str]:
     import pytesseract
     from PIL import Image
 
     image = Image.open(io.BytesIO(image_bytes))
     text = pytesseract.image_to_string(image, lang="rus+eng")
-    return [line.strip() for line in text.splitlines() if line.strip()]
+    lines: list[str] = []
+    for raw in text.splitlines():
+        cleaned = clean_local_ocr_line(raw)
+        if cleaned:
+            lines.append(cleaned)
+    return lines
 
 
 async def extract_roster_lines(image_bytes: bytes, mime: str) -> list[str]:
