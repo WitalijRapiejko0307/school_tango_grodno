@@ -772,7 +772,9 @@ async def _enroll_claim_by_id(
         guest = await _person_by_telegram(session, telegram_user_id)
         try:
             if guest is not None and guest.id != person_id:
-                await session.delete(guest)
+                guest.telegram_user_id = None
+                guest.username = None
+                await session.flush()
             person = await claim_person(
                 session,
                 person_id,
@@ -791,6 +793,13 @@ async def _enroll_claim_by_id(
                 )
                 return
             raise
+        except Exception:
+            await session.rollback()
+            logger.exception("Roster claim failed for telegram %s", telegram_user_id)
+            await reply_target.answer(
+                "Не получилось привязать карточку. Напишите фамилию и имя ещё раз."
+            )
+            return
     await state.clear()
     await reply_target.answer(text, reply_markup=reply_markup_for_role("client"))
 
