@@ -170,3 +170,17 @@ async def test_claim_sets_telegram_id(db_session: AsyncSession) -> None:
             username=None,
             telegram_full_name="Other",
         )
+
+
+def test_numbered_lines_replace_draft_rows_instead_of_new_list() -> None:
+    from app.channels.telegram import _apply_roster_replacements, _parse_lines_to_draft_dicts
+
+    drafts = _parse_lines_to_draft_dicts("Рапейко\nМордань")
+    text = "1. Рапейко Виталий\n2. Мордань Виктория"
+    updated, error = _apply_roster_replacements(drafts, text)
+    assert error == ""
+    assert [item["full_name"] for item in updated] == [
+        "Рапейко Виталий",
+        "Мордань Виктория",
+    ]
+    assert all(item["needs_fix"] is False for item in updated)

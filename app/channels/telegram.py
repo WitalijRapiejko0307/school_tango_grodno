@@ -590,7 +590,7 @@ class EnrollFSM(StatesGroup):
 
 
 _ROSTER_DELETE_RE = re.compile(r"^\s*удалить\s+(\d+)\s*$", re.IGNORECASE)
-_ROSTER_REPLACE_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+)$", re.IGNORECASE)
+_ROSTER_REPLACE_RE = re.compile(r"^\s*(\d+)\s*[.:)]\s*(.+)$", re.IGNORECASE)
 
 
 def _roster_draft_to_dict(item: RosterDraftItem) -> dict[str, object]:
@@ -636,10 +636,38 @@ def _format_roster_preview(drafts: list[dict[str, object]]) -> str:
         lines.append(f"{index}. {d['full_name']}{mark}{note_part}")
     lines.append("")
     lines.append(
-        "«готово» — сохранить, «отмена» — отменить, «удалить N», «N: фамилия имя», "
-        "или новые строки для добавления."
+        "«готово» — сохранить, «отмена» — отменить, «удалить N», "
+        "«N. фамилия имя» — заменить строку, или новые строки для добавления."
     )
     return "\n".join(lines)
+
+
+def _apply_roster_replacements(
+    drafts: list[dict[str, object]], text: str
+) -> tuple[list[dict[str, object]], str | None]:
+    """Apply numbered lines like ``30. Рапейко Виталий`` onto an existing draft.
+
+    Returns the updated draft and an error message when a number is missing.
+    ``None`` as the draft means the message is not a set of replacements.
+    """
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    edits: list[tuple[int, str]] = []
+    for line in lines:
+        match = _ROSTER_REPLACE_RE.match(line)
+        if match is None:
+            return drafts, None
+        edits.append((int(match.group(1)), match.group(2).strip()))
+    if not edits:
+        return drafts, None
+    updated = list(drafts)
+    for index, body in sorted(edits, key=lambda item: item[0], reverse=True):
+        if not 1 <= index <= len(updated):
+            return drafts, f"Нет строки с таким номером: {index}."
+        new_items = _parse_lines_to_draft_dicts(body)
+        if not new_items:
+            return drafts, "Пустая строка."
+        updated[index - 1 : index] = new_items
+    return updated, ""
 
 
 def _format_admin_contacts_list(contacts: list) -> str:
@@ -1841,26 +1869,17 @@ async def fsm_roster_text(message: Message, state: FSMContext) -> None:
             await message.answer("Нет строки с таким номером.")
         return
 
-    replace_match = _ROSTER_REPLACE_RE.match(text)
-    if replace_match:
-        index = int(replace_match.group(1))
-        new_items = _parse_lines_to_draft_dicts(replace_match.group(2))
-        if not new_items:
-            await message.answer("Пустая строка.")
+    replaced, replace_error = _apply_roster_replacements(drafts, text)
+    if replace_error is not None:
+        if replace_error:
+            await message.answer(replace_error)
             return
-        if 1 <= index <= len(drafts):
-            drafts[index - 1 : index] = new_items
-            await state.update_data(drafts=drafts)
-            await message.answer(_format_roster_preview(drafts))
-        else:
-            await message.answer("Нет строки с таким номером.")
+        drafts = replaced
+        await state.update_data(drafts=drafts)
+        await message.answer(_format_roster_preview(drafts))
         return
 
-    lines = [line for line in text.splitlines() if line.strip()]
-    if len(lines) > 1:
-        drafts = _parse_lines_to_draft_dicts(text)
-    else:
-        drafts.extend(_parse_lines_to_draft_dicts(text))
+    drafts.extend(_parse_lines_to_draft_dicts(text))
     await state.update_data(drafts=drafts)
     await message.answer(_format_roster_preview(drafts))
 
