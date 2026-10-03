@@ -16,6 +16,9 @@ class Settings(BaseSettings):
     SCHOOL_TZ: str = "Europe/Minsk"
     PUBLIC_URL: str = ""
     BOOTSTRAP_ADMIN_TELEGRAM_ID: int | None = None
+    VISION_API_KEY: str = ""
+    VISION_API_URL: str = ""
+    VISION_MODEL: str = "gpt-4o-mini"
 
 
 @lru_cache

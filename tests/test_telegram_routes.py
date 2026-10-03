@@ -53,6 +53,7 @@ def test_role_keyboard_admin() -> None:
         "Напоминания",
         "Гости",
         "Админы",
+        "Состав",
     ]
 
 

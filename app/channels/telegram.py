@@ -64,6 +64,15 @@ from app.services.notifications import (
     second_booking_prompt_text,
 )
 from app.services.school_time import format_school_date, format_school_datetime
+from app.services.ocr import extract_roster_lines
+from app.services.roster import (
+    RosterDraftItem,
+    admin_contacts,
+    claim_person,
+    confirm_roster,
+    find_unclaimed_by_query,
+    parse_roster_line,
+)
 from app.services.schedule import (
     WEEKDAY_LABELS,
     active_group_membership,
@@ -93,6 +102,7 @@ BTN_PRICE = "Прайс"
 BTN_REMINDERS = "Напоминания"
 BTN_GUESTS = "Гости"
 BTN_ADMINS = "Админы"
+BTN_ROSTER = "Состав"
 BTN_MY_GROUP = "Моя группа"
 BTN_OTHER_GROUP = "Не со своей группой"
 BTN_BALANCE = "Остаток"
@@ -107,6 +117,7 @@ ADMIN_MENU = [
     BTN_REMINDERS,
     BTN_GUESTS,
     BTN_ADMINS,
+    BTN_ROSTER,
 ]
 CLIENT_MENU = [BTN_PRICE, BTN_MY_GROUP, BTN_OTHER_GROUP, BTN_BALANCE]
 GUEST_MENU = [BTN_SCHEDULE, BTN_CONTACTS]
@@ -144,6 +155,7 @@ def reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=texts[2]), KeyboardButton(text=texts[3])],
             [KeyboardButton(text=texts[4]), KeyboardButton(text=texts[5])],
             [KeyboardButton(text=texts[6])],
+            [KeyboardButton(text=texts[7])],
         ]
     elif role == "client":
         rows = [
@@ -376,27 +388,82 @@ async def _finish_assign_group(
     group_id: str,
 ) -> None:
     today = _today_local()
-    notify_id: int | None = None
+    guest_notify_id: int | None = None
+    transfer_notify: tuple[int, str, str, str | None] | None = None
     async with async_session_maker() as session:
         target = await session.get(Person, person_id)
         was_guest = target is not None and target.role == "guest"
+        prev_membership = await _active_membership(session, person_id)
+        old_group_name: str | None = None
+        if prev_membership is not None:
+            old_group_name = await _session_group_name(
+                session, prev_membership.group_id
+            )
+        new_group_name = await _session_group_name(session, group_id)
         await assign_group(session, person_id, group_id, today)
+        if (
+            target is not None
+            and target.telegram_user_id is not None
+            and prev_membership is not None
+            and old_group_name is not None
+        ):
+            await materialize_range(session, today, today + timedelta(days=21))
+            now = datetime.now(UTC)
+            next_result = await session.execute(
+                select(SchoolSession)
+                .where(
+                    SchoolSession.group_id == group_id,
+                    SchoolSession.starts_at > now,
+                    SchoolSession.status == "scheduled",
+                )
+                .order_by(SchoolSession.starts_at)
+                .limit(1)
+            )
+            nxt = next_result.scalar_one_or_none()
+            next_line: str | None = None
+            if nxt is not None:
+                next_line = (
+                    f"Ближайшее занятие: {format_school_datetime(nxt.starts_at)}, "
+                    f"{nxt.place}"
+                )
+            transfer_notify = (
+                target.telegram_user_id,
+                old_group_name,
+                new_group_name,
+                next_line,
+            )
+        elif (
+            was_guest
+            and prev_membership is None
+            and target is not None
+            and target.telegram_user_id is not None
+        ):
+            guest_notify_id = target.telegram_user_id
         await session.commit()
-        if was_guest and target is not None and target.telegram_user_id is not None:
-            notify_id = target.telegram_user_id
     await state.clear()
     await query.answer("Готово")
     if query.message:
         await query.message.answer("Человек назначен в группу.")
-    if notify_id is not None:
+    if guest_notify_id is not None:
         try:
             await query.bot.send_message(
-                notify_id,
+                guest_notify_id,
                 "Вас записали в группу. Теперь вы клиент школы.",
                 reply_markup=reply_markup_for_role("client"),
             )
         except Exception:
-            logger.exception("Failed to refresh client menu for %s", notify_id)
+            logger.exception("Failed to refresh client menu for %s", guest_notify_id)
+    if transfer_notify is not None:
+        tid, from_name, to_name, next_line = transfer_notify
+        lines = [
+            f"Вас перевели из группы «{from_name}» в группу «{to_name}».",
+        ]
+        if next_line is not None:
+            lines.append(next_line)
+        try:
+            await query.bot.send_message(tid, "\n".join(lines))
+        except Exception:
+            logger.exception("Failed to notify group transfer for %s", tid)
 
 
 async def _format_contacts(session: AsyncSession) -> str:
@@ -514,6 +581,166 @@ class AdminMenuFSM(StatesGroup):
     choosing = State()
 
 
+class RosterFSM(StatesGroup):
+    active = State()
+
+
+class EnrollFSM(StatesGroup):
+    waiting_name = State()
+
+
+_ROSTER_DELETE_RE = re.compile(r"^\s*удалить\s+(\d+)\s*$", re.IGNORECASE)
+_ROSTER_REPLACE_RE = re.compile(r"^\s*(\d+)\s*:\s*(.+)$", re.IGNORECASE)
+
+
+def _roster_draft_to_dict(item: RosterDraftItem) -> dict[str, object]:
+    return {
+        "full_name": item.full_name,
+        "name_key": item.name_key,
+        "needs_fix": item.needs_fix,
+        "note": item.note,
+    }
+
+
+def _roster_drafts_from_dicts(raw: list[dict[str, object]]) -> list[RosterDraftItem]:
+    out: list[RosterDraftItem] = []
+    for d in raw:
+        nk = d.get("name_key")
+        out.append(
+            RosterDraftItem(
+                full_name=str(d["full_name"]),
+                name_key=None if nk is None else str(nk),
+                needs_fix=bool(d.get("needs_fix")),
+                note=str(d.get("note") or ""),
+            )
+        )
+    return out
+
+
+def _parse_lines_to_draft_dicts(text: str) -> list[dict[str, object]]:
+    drafts: list[dict[str, object]] = []
+    for line in text.splitlines():
+        for item in parse_roster_line(line):
+            drafts.append(_roster_draft_to_dict(item))
+    return drafts
+
+
+def _format_roster_preview(drafts: list[dict[str, object]]) -> str:
+    if not drafts:
+        return "Черновик пуст."
+    lines = ["Черновик состава:"]
+    for index, d in enumerate(drafts, start=1):
+        mark = " — нужна правка" if d.get("needs_fix") else ""
+        note = str(d.get("note") or "").strip()
+        note_part = f" ({note})" if note else ""
+        lines.append(f"{index}. {d['full_name']}{mark}{note_part}")
+    lines.append("")
+    lines.append(
+        "«готово» — сохранить, «отмена» — отменить, «удалить N», «N: фамилия имя», "
+        "или новые строки для добавления."
+    )
+    return "\n".join(lines)
+
+
+def _format_admin_contacts_list(contacts: list) -> str:
+    lines = ["Свяжитесь с администратором, чтобы вас записали:"]
+    for contact in contacts:
+        label = f"@{contact.username}" if contact.username else contact.full_name
+        if contact.phone:
+            label = f"{label}, {contact.phone}"
+        lines.append(f"• {label}")
+    return "\n".join(lines)
+
+
+async def _group_and_next_session_message(
+    session: AsyncSession, person_id: str
+) -> str:
+    membership = await _active_membership(session, person_id)
+    if membership is None:
+        return "Вы записаны на занятия. Расписание появится, когда назначат занятия."
+    gname = await _session_group_name(session, membership.group_id)
+    today = _today_local()
+    await materialize_range(session, today, today + timedelta(days=21))
+    now = datetime.now(UTC)
+    next_result = await session.execute(
+        select(SchoolSession)
+        .where(
+            SchoolSession.group_id == membership.group_id,
+            SchoolSession.starts_at > now,
+            SchoolSession.status == "scheduled",
+        )
+        .order_by(SchoolSession.starts_at)
+        .limit(1)
+    )
+    nxt = next_result.scalar_one_or_none()
+    if nxt:
+        return (
+            f"Вы в «{gname}».\n"
+            f"Ближайшее: {format_school_datetime(nxt.starts_at)}, {nxt.place}"
+        )
+    return f"Вы в «{gname}». Ближайших занятий пока нет."
+
+
+async def _notify_admins_claim(
+    bot: Bot, session: AsyncSession, claimed_full_name: str, telegram_user_id: int
+) -> None:
+    result = await session.execute(
+        select(Person).where(
+            Person.role == "admin",
+            Person.telegram_user_id.is_not(None),
+        )
+    )
+    for admin in result.scalars().all():
+        if admin.telegram_user_id == telegram_user_id:
+            continue
+        try:
+            await bot.send_message(
+                admin.telegram_user_id,
+                f"Пользователь Telegram {telegram_user_id} привязался к карточке «{claimed_full_name}».",
+            )
+        except Exception:
+            logger.exception(
+                "Failed to notify admin %s about roster claim",
+                admin.telegram_user_id,
+            )
+
+
+async def _enroll_claim_by_id(
+    bot: Bot,
+    telegram_user_id: int,
+    username: str | None,
+    telegram_full_name: str,
+    person_id: str,
+    state: FSMContext,
+    reply_target: Message,
+) -> None:
+    async with async_session_maker() as session:
+        guest = await _person_by_telegram(session, telegram_user_id)
+        try:
+            if guest is not None and guest.id != person_id:
+                await session.delete(guest)
+            person = await claim_person(
+                session,
+                person_id,
+                telegram_user_id=telegram_user_id,
+                username=username,
+                telegram_full_name=telegram_full_name,
+            )
+            text = await _group_and_next_session_message(session, person.id)
+            await _notify_admins_claim(bot, session, person.full_name, telegram_user_id)
+            await session.commit()
+        except ValueError as exc:
+            await session.rollback()
+            if "telegram_already_linked" in str(exc):
+                await reply_target.answer(
+                    "Эта карточка уже привязана к другому Telegram."
+                )
+                return
+            raise
+    await state.clear()
+    await reply_target.answer(text, reply_markup=reply_markup_for_role("client"))
+
+
 # --- /start ---
 
 
@@ -534,7 +761,118 @@ async def cmd_start(message: Message, state: FSMContext) -> None:
                 "\n\nЕсли вас пригласили администратором, нажмите «Подтвердить телефон» "
                 "и отправьте свой номер. Иначе откройте расписание как гость."
             )
+        await message.answer(text, reply_markup=markup)
+        enroll_kb = InlineKeyboardMarkup(
+            inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="Да", callback_data="enroll_yes"),
+                    InlineKeyboardButton(text="Нет", callback_data="enroll_no"),
+                ]
+            ]
+        )
+        await message.answer("Вы уже записаны на занятия?", reply_markup=enroll_kb)
+        return
     await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data == "enroll_no")
+async def cb_enroll_no(query: CallbackQuery, state: FSMContext) -> None:
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Хорошо. Откройте «Расписание» в меню ниже, чтобы выбрать занятие.",
+            reply_markup=reply_markup_for_role("guest"),
+        )
+
+
+@router.callback_query(F.data == "enroll_yes")
+async def cb_enroll_yes(query: CallbackQuery, state: FSMContext) -> None:
+    if query.from_user is None:
+        return
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, query.from_user.id)
+        if person is None or person.role != "guest":
+            await query.answer("Недоступно", show_alert=True)
+            return
+    await state.set_state(EnrollFSM.waiting_name)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Напишите одной строкой фамилию и имя — в любом порядке."
+        )
+
+
+@router.callback_query(F.data.startswith("claim_pick:"))
+async def cb_claim_pick(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.from_user is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if query.message is None:
+        return
+    await _enroll_claim_by_id(
+        query.bot,
+        query.from_user.id,
+        query.from_user.username,
+        query.from_user.full_name or "User",
+        person_id,
+        state,
+        query.message,
+    )
+    await query.answer()
+
+
+@router.message(EnrollFSM.waiting_name)
+async def fsm_enroll_name(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not message.text:
+        return
+    query_text = message.text.strip()
+    if not query_text:
+        return
+    async with async_session_maker() as session:
+        matches = await find_unclaimed_by_query(session, query_text)
+        if not matches:
+            contacts = await admin_contacts(session)
+            await session.commit()
+            if contacts:
+                await message.answer(_format_admin_contacts_list(contacts))
+            else:
+                await message.answer(
+                    "Совпадений нет. Обратитесь к администратору школы."
+                )
+            await state.clear()
+            return
+        if len(matches) == 1:
+            await session.commit()
+            await _enroll_claim_by_id(
+                message.bot,
+                message.from_user.id,
+                message.from_user.username,
+                message.from_user.full_name or "User",
+                matches[0].id,
+                state,
+                message,
+            )
+            return
+        buttons: list[list[InlineKeyboardButton]] = []
+        for person in matches:
+            membership = await _active_membership(session, person.id)
+            gname = "—"
+            if membership is not None:
+                gname = await _session_group_name(session, membership.group_id)
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text=f"{person.full_name} ({gname})",
+                        callback_data=f"claim_pick:{person.id}",
+                    )
+                ]
+            )
+        await session.commit()
+    await message.answer(
+        "Найдено несколько совпадений. Выберите себя:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
 
 
 @router.message(F.contact)
@@ -828,6 +1166,24 @@ async def cb_other_group_back(query: CallbackQuery) -> None:
 
 
 # --- Inline pick helpers (groups, products, people) ---
+
+
+@router.callback_query(F.data.startswith("pick_roster_grp:"))
+async def cb_pick_roster_group(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    await state.set_state(RosterFSM.active)
+    await state.update_data(group_id=group_id, drafts=[])
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Пришлите строки состава (по одному человеку на строку) или фото списка."
+        )
 
 
 @router.callback_query(F.data.startswith("pick_grp:"))
@@ -1346,6 +1702,148 @@ async def menu_guests_summary(message: Message) -> None:
                 f"{format_school_datetime(school_session.starts_at)}, {school_session.place}"
             )
         await message.answer("\n".join(lines))
+
+
+@router.message(F.text == BTN_ROSTER)
+async def menu_roster(message: Message, state: FSMContext) -> None:
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
+        if person is None or not _is_admin(person):
+            await message.answer(REFUSAL if person and not _is_admin(person) else "")
+            return
+        groups = list(
+            (await session.execute(select(Group).order_by(Group.name))).scalars().all()
+        )
+    await state.set_state(RosterFSM.active)
+    await state.update_data(group_id=None, drafts=[])
+    rows = [
+        [InlineKeyboardButton(text=g.name, callback_data=f"pick_roster_grp:{g.id}")]
+        for g in groups
+    ]
+    kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
+    await message.answer(
+        "Выберите группу для состава или напишите название новой группы.",
+        reply_markup=kb,
+    )
+
+
+@router.message(RosterFSM.active, F.photo)
+async def fsm_roster_photo(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not message.photo:
+        return
+    data = await state.get_data()
+    group_id = data.get("group_id")
+    if not group_id:
+        await message.answer("Сначала выберите или создайте группу.")
+        return
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    downloaded = await message.bot.download_file(file.file_path)
+    image_bytes = downloaded.read()
+    try:
+        lines = await extract_roster_lines(image_bytes, "image/jpeg")
+    except RuntimeError as exc:
+        if str(exc) == "ocr_not_configured":
+            await message.answer(
+                "Распознавание фото не настроено. Введите состав текстом — по строке на человека."
+            )
+            return
+        raise
+    drafts = []
+    for line in lines:
+        for item in parse_roster_line(line):
+            drafts.append(_roster_draft_to_dict(item))
+    await state.update_data(drafts=drafts)
+    await message.answer(_format_roster_preview(drafts))
+
+
+@router.message(RosterFSM.active, F.text)
+async def fsm_roster_text(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or message.text is None:
+        return
+    text = message.text.strip()
+    if not text:
+        return
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, message.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await message.answer(REFUSAL)
+            await state.clear()
+            return
+
+    data = await state.get_data()
+    group_id = data.get("group_id")
+    drafts: list[dict[str, object]] = list(data.get("drafts") or [])
+
+    if group_id is None:
+        async with async_session_maker() as session:
+            group = await create_group(session, text)
+            await session.commit()
+            group_id = group.id
+        await state.update_data(group_id=group_id, drafts=[])
+        await message.answer(
+            f"Группа «{text}» создана.\n"
+            "Пришлите строки состава (по одному человеку на строку) или фото списка."
+        )
+        return
+
+    lowered = text.lower()
+    if lowered == "отмена":
+        await state.clear()
+        await message.answer("Загрузка состава отменена.")
+        return
+
+    if lowered == "готово":
+        items = _roster_drafts_from_dicts(drafts)
+        needs_fix_count = sum(1 for item in items if item.needs_fix or not item.name_key)
+        async with async_session_maker() as session:
+            result = await confirm_roster(session, group_id, items)
+            await session.commit()
+        await state.clear()
+        parts = [
+            f"Добавлено: {result.created}.",
+            f"Пропущено: {result.skipped}.",
+        ]
+        if needs_fix_count:
+            parts.append(
+                f"Из них {needs_fix_count} с пометкой «нужна правка» не записывались."
+            )
+        await message.answer(" ".join(parts))
+        return
+
+    delete_match = _ROSTER_DELETE_RE.match(text)
+    if delete_match:
+        index = int(delete_match.group(1))
+        if 1 <= index <= len(drafts):
+            drafts.pop(index - 1)
+            await state.update_data(drafts=drafts)
+            await message.answer(_format_roster_preview(drafts))
+        else:
+            await message.answer("Нет строки с таким номером.")
+        return
+
+    replace_match = _ROSTER_REPLACE_RE.match(text)
+    if replace_match:
+        index = int(replace_match.group(1))
+        new_items = _parse_lines_to_draft_dicts(replace_match.group(2))
+        if not new_items:
+            await message.answer("Пустая строка.")
+            return
+        if 1 <= index <= len(drafts):
+            drafts[index - 1 : index] = new_items
+            await state.update_data(drafts=drafts)
+            await message.answer(_format_roster_preview(drafts))
+        else:
+            await message.answer("Нет строки с таким номером.")
+        return
+
+    lines = [line for line in text.splitlines() if line.strip()]
+    if len(lines) > 1:
+        drafts = _parse_lines_to_draft_dicts(text)
+    else:
+        drafts.extend(_parse_lines_to_draft_dicts(text))
+    await state.update_data(drafts=drafts)
+    await message.answer(_format_roster_preview(drafts))
 
 
 @router.message(F.text == BTN_ADMINS)
