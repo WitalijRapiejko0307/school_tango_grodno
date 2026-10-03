@@ -275,7 +275,7 @@ class GuestRsvpStatus:
 
 
 class BotChatMessage(Base):
-    """Telegram message sent by the bot (for deletion rules)."""
+    """Chat message kept so the bot can delete bot and user messages."""
 
     __tablename__ = "bot_chat_messages"
     __table_args__ = (Index("ix_bot_chat_messages_person_sent", "person_id", "sent_at"),)

@@ -8,7 +8,7 @@ from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
 
-from aiogram import Bot, F, Router
+from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
@@ -51,7 +51,11 @@ from app.services.identity import (
     invite_admin,
     upsert_from_telegram,
 )
-from app.services.bot_messages import bind_outbound_school_session_id, reset_outbound_context
+from app.services.bot_messages import (
+    bind_outbound_school_session_id,
+    reset_outbound_context,
+    track_user_message,
+)
 from app.services.notifications import (
     DueReminder,
     answer_attendance,
@@ -92,6 +96,28 @@ from app.services.schedule import (
 logger = logging.getLogger(__name__)
 
 router = Router(name="telegram")
+
+
+class _TrackUserMessageMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if (
+            isinstance(event, Message)
+            and event.from_user is not None
+            and not event.from_user.is_bot
+            and event.bot is not None
+        ):
+            try:
+                await track_user_message(event.bot, event.chat.id, event.message_id)
+            except Exception:
+                logger.exception(
+                    "Failed to track user message %s in chat %s",
+                    event.message_id,
+                    event.chat.id,
+                )
+        return await handler(event, data)
+
+
+router.message.middleware(_TrackUserMessageMiddleware())
 
 # --- Menu labels (variant A) ---
 

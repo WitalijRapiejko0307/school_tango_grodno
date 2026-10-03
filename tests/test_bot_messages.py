@@ -128,6 +128,34 @@ async def test_chat_limit_keeps_menu_anchor(db_session: AsyncSession) -> None:
     assert any(r.telegram_message_id == 9999 for r in rows)
 
 
+async def test_shared_limit_counts_user_and_bot_messages(
+    db_session: AsyncSession,
+) -> None:
+    person = await _client(db_session)
+    bot = AsyncMock()
+    chat_id = person.telegram_user_id or 0
+    base = datetime(2026, 10, 2, 12, 0, tzinfo=UTC)
+    for i in range(CLIENT_GUEST_CHAT_LIMIT + 1):
+        db_session.add(
+            BotChatMessage(
+                person_id=person.id,
+                chat_id=chat_id,
+                telegram_message_id=3000 + i,
+                school_session_id=None,
+                is_reply_menu_anchor=False,
+                sent_at=base + timedelta(seconds=i),
+            )
+        )
+    await db_session.flush()
+
+    await apply_message_deletions(
+        db_session, bot, person, today=date(2026, 10, 2)
+    )
+
+    assert bot.delete_message.await_count == 1
+    assert bot.delete_message.await_args.args[1] == 3000
+
+
 async def test_admin_limit_is_twenty(db_session: AsyncSession) -> None:
     admin = Person(full_name="Admin", role="admin", telegram_user_id=9001)
     db_session.add(admin)

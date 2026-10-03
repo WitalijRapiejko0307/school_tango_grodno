@@ -1,4 +1,8 @@
-"""Track outbound Telegram bot messages and apply chat cleanup rules."""
+"""Track chat messages and apply cleanup rules.
+
+The feed limit counts bot and user messages together. The reply-keyboard
+anchor is kept so the bottom menu is not removed with the oldest messages.
+"""
 
 from __future__ import annotations
 
@@ -174,5 +178,24 @@ async def track_sent_message(
             telegram_message_id=telegram_message_id,
             school_session_id=sid,
             sets_reply_menu=sets_menu,
+        )
+        await session.commit()
+
+
+async def track_user_message(bot: Bot, chat_id: int, telegram_message_id: int) -> None:
+    """Remember a person's own message and trim the shared chat limit."""
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Person).where(Person.telegram_user_id == chat_id)
+        )
+        person = result.scalar_one_or_none()
+        if person is None:
+            return
+        await record_bot_message(
+            session,
+            bot,
+            person=person,
+            chat_id=chat_id,
+            telegram_message_id=telegram_message_id,
         )
         await session.commit()
