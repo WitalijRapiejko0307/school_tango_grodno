@@ -69,21 +69,21 @@ async def lifespan(app: FastAPI):
 
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # create_all does not add columns to tables that already exist.
-        await conn.execute(
-            text(
-                "ALTER TABLE persons ADD COLUMN IF NOT EXISTS "
-                "name_key VARCHAR(255)"
-            )
-        )
-        await conn.execute(
-            text(
-                "CREATE INDEX IF NOT EXISTS ix_persons_name_key "
-                "ON persons (name_key)"
-            )
-        )
         dialect = conn.engine.dialect.name
         if dialect == "postgresql":
+            # create_all does not add columns to tables that already exist.
+            await conn.execute(
+                text(
+                    "ALTER TABLE persons ADD COLUMN IF NOT EXISTS "
+                    "name_key VARCHAR(255)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "CREATE INDEX IF NOT EXISTS ix_persons_name_key "
+                    "ON persons (name_key)"
+                )
+            )
             has_alembic = await conn.execute(
                 text(
                     "SELECT 1 FROM information_schema.tables "

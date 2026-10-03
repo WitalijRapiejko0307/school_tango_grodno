@@ -56,6 +56,18 @@ from app.services.bot_messages import (
     reset_outbound_context,
     track_user_message,
 )
+from app.services.notices import (
+    cancel_notice_text,
+    cancel_session,
+    countable,
+    delivery_report,
+    free_notice_text,
+    group_audience,
+    notice_audience,
+    reschedule_notice_text,
+    reschedule_session,
+    upcoming_sessions,
+)
 from app.services.notifications import (
     DueReminder,
     answer_attendance,
@@ -129,6 +141,8 @@ BTN_REMINDERS = "Напоминания"
 BTN_GUESTS = "Гости"
 BTN_ADMINS = "Админы"
 BTN_ROSTER = "Состав"
+BTN_SESSIONS = "Занятия"
+BTN_NOTICE = "Сообщение"
 BTN_MY_GROUP = "Моя группа"
 BTN_OTHER_GROUP = "Не со своей группой"
 BTN_BALANCE = "Остаток"
@@ -144,6 +158,8 @@ ADMIN_MENU = [
     BTN_GUESTS,
     BTN_ADMINS,
     BTN_ROSTER,
+    BTN_SESSIONS,
+    BTN_NOTICE,
 ]
 CLIENT_MENU = [BTN_PRICE, BTN_MY_GROUP, BTN_OTHER_GROUP, BTN_BALANCE]
 GUEST_MENU = [BTN_SCHEDULE, BTN_CONTACTS]
@@ -180,8 +196,8 @@ def reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
             [KeyboardButton(text=texts[0]), KeyboardButton(text=texts[1])],
             [KeyboardButton(text=texts[2]), KeyboardButton(text=texts[3])],
             [KeyboardButton(text=texts[4]), KeyboardButton(text=texts[5])],
-            [KeyboardButton(text=texts[6])],
-            [KeyboardButton(text=texts[7])],
+            [KeyboardButton(text=texts[6]), KeyboardButton(text=texts[7])],
+            [KeyboardButton(text=texts[8]), KeyboardButton(text=texts[9])],
         ]
     elif role == "client":
         rows = [
@@ -613,6 +629,12 @@ class RosterFSM(StatesGroup):
 
 class EnrollFSM(StatesGroup):
     waiting_name = State()
+
+
+class NoticeFSM(StatesGroup):
+    move_when = State()
+    move_place = State()
+    text = State()
 
 
 _ROSTER_DELETE_RE = re.compile(r"^\s*удалить\s+(\d+)\s*$", re.IGNORECASE)
@@ -1920,6 +1942,304 @@ async def fsm_roster_text(message: Message, state: FSMContext) -> None:
     drafts.extend(_parse_lines_to_draft_dicts(text))
     await state.update_data(drafts=drafts)
     await message.answer(_format_roster_preview(drafts))
+
+
+def _parse_school_slot(text: str) -> datetime | None:
+    try:
+        parsed = datetime.strptime(text.strip(), "%d.%m.%Y %H:%M")
+    except ValueError:
+        return None
+    return parsed.replace(tzinfo=ZoneInfo(get_settings().SCHOOL_TZ))
+
+
+async def _send_notice(bot: Bot, people: list[Person], text: str) -> str:
+    reachable, missing = countable(people)
+    delivered = 0
+    failed = missing
+    for person in reachable:
+        try:
+            await bot.send_message(person.telegram_user_id, text)  # type: ignore[arg-type]
+            delivered += 1
+        except Exception:
+            logger.exception("Notice failed for %s", person.id)
+            failed += 1
+    return delivery_report(delivered, failed)
+
+
+async def _admin_person(message: Message) -> Person | None:
+    if message.from_user is None:
+        return None
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, message.from_user.id)
+        if person is None or not _is_admin(person):
+            return None
+        return person
+
+
+@router.message(F.text == BTN_SESSIONS)
+async def menu_sessions(message: Message, state: FSMContext) -> None:
+    if await _admin_person(message) is None:
+        await message.answer(REFUSAL)
+        return
+    await state.clear()
+    today = _today_local()
+    now = datetime.now(UTC)
+    async with async_session_maker() as session:
+        await materialize_range(session, today, today + timedelta(days=21))
+        rows = await upcoming_sessions(session, now)
+        await session.commit()
+    if not rows:
+        await message.answer("Предстоящих занятий нет.")
+        return
+    buttons = []
+    for school_session, group_name in rows[:30]:
+        label = (
+            f"{group_name}, {format_school_datetime(school_session.starts_at)}, "
+            f"{school_session.place}"
+        )
+        buttons.append(
+            [
+                InlineKeyboardButton(
+                    text=label[:60],
+                    callback_data=f"ntc_sess:{school_session.id}",
+                )
+            ]
+        )
+    await message.answer(
+        "Предстоящие занятия:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("ntc_sess:"))
+async def cb_notice_session(query: CallbackQuery) -> None:
+    if query.data is None or query.from_user is None or query.message is None:
+        return
+    session_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, query.from_user.id)
+        school_session = await session.get(SchoolSession, session_id)
+        if admin is None or not _is_admin(admin) or school_session is None:
+            await query.answer(REFUSAL, show_alert=True)
+            return
+        group_name = await _session_group_name(session, school_session.group_id)
+        audience = await notice_audience(session, session_id)
+    await query.answer()
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Перенести", callback_data=f"ntc_move:{session_id}"
+                ),
+                InlineKeyboardButton(
+                    text="Отменить", callback_data=f"ntc_cancel:{session_id}"
+                ),
+            ]
+        ]
+    )
+    await query.message.answer(
+        f"{group_name}, {format_school_datetime(school_session.starts_at)}, "
+        f"{school_session.place}.\n"
+        f"Сообщение уйдёт {len(audience)} чел.",
+        reply_markup=kb,
+    )
+
+
+@router.callback_query(F.data.startswith("ntc_move:"))
+async def cb_notice_move(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.from_user is None or query.message is None:
+        return
+    session_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, query.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await query.answer(REFUSAL, show_alert=True)
+            return
+    await state.set_state(NoticeFSM.move_when)
+    await state.update_data(session_id=session_id)
+    await query.answer()
+    await query.message.answer("Новые дата и время: ДД.ММ.ГГГГ ЧЧ:ММ")
+
+
+@router.message(NoticeFSM.move_when)
+async def fsm_notice_when(message: Message, state: FSMContext) -> None:
+    if message.text is None:
+        return
+    starts = _parse_school_slot(message.text)
+    if starts is None:
+        await message.answer("Нужен формат ДД.ММ.ГГГГ ЧЧ:ММ.")
+        return
+    await state.update_data(new_starts=starts.isoformat())
+    await state.set_state(NoticeFSM.move_place)
+    await message.answer("Место. Чтобы оставить прежнее, отправьте «то же».")
+
+
+@router.message(NoticeFSM.move_place)
+async def fsm_notice_place(message: Message, state: FSMContext) -> None:
+    if message.text is None or message.from_user is None or message.bot is None:
+        return
+    data = await state.get_data()
+    session_id = data.get("session_id")
+    raw_starts = data.get("new_starts")
+    if not session_id or not raw_starts:
+        await state.clear()
+        await message.answer("Начните снова с «Занятия».")
+        return
+    new_starts = datetime.fromisoformat(raw_starts)
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, message.from_user.id)
+        school_session = await session.get(SchoolSession, session_id)
+        if admin is None or not _is_admin(admin) or school_session is None:
+            await message.answer(REFUSAL)
+            await state.clear()
+            return
+        place = (
+            school_session.place
+            if message.text.strip().lower() == "то же"
+            else message.text.strip()
+        )
+        group_name = await _session_group_name(session, school_session.group_id)
+        audience = await notice_audience(session, session_id)
+        try:
+            updated, old_starts, old_place = await reschedule_session(
+                session, session_id, new_starts, place
+            )
+        except ValueError:
+            await message.answer("Это занятие уже нельзя перенести.")
+            await state.clear()
+            return
+        text = reschedule_notice_text(
+            group_name, old_starts, old_place, updated.starts_at, updated.place
+        )
+        await session.commit()
+    report = await _send_notice(message.bot, audience, text)
+    await state.clear()
+    await message.answer(f"{text}\n\n{report}")
+
+
+@router.callback_query(F.data.startswith("ntc_cancel:"))
+async def cb_notice_cancel(query: CallbackQuery) -> None:
+    if query.data is None or query.from_user is None or query.message is None or query.bot is None:
+        return
+    session_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, query.from_user.id)
+        school_session = await session.get(SchoolSession, session_id)
+        if admin is None or not _is_admin(admin) or school_session is None:
+            await query.answer(REFUSAL, show_alert=True)
+            return
+        group_name = await _session_group_name(session, school_session.group_id)
+        audience = await notice_audience(session, session_id)
+        text = cancel_notice_text(
+            group_name, school_session.starts_at, school_session.place
+        )
+        try:
+            await cancel_session(session, session_id)
+        except ValueError:
+            await query.answer("Уже отменено", show_alert=True)
+            return
+        await session.commit()
+    report = await _send_notice(query.bot, audience, text)
+    await query.answer()
+    await query.message.answer(f"{text}\n\n{report}")
+
+
+@router.message(F.text == BTN_NOTICE)
+async def menu_notice(message: Message, state: FSMContext) -> None:
+    if await _admin_person(message) is None:
+        await message.answer(REFUSAL)
+        return
+    await state.clear()
+    async with async_session_maker() as session:
+        groups = list(
+            (await session.execute(select(Group).order_by(Group.name))).scalars().all()
+        )
+        people = list(
+            (
+                await session.execute(
+                    select(Person)
+                    .where(Person.telegram_user_id.is_not(None))
+                    .order_by(Person.full_name)
+                )
+            ).scalars().all()
+        )
+    buttons = [
+        [InlineKeyboardButton(text=f"Группа: {group.name}", callback_data=f"ntc_grp:{group.id}")]
+        for group in groups
+    ]
+    buttons.extend(
+        [
+            [
+                InlineKeyboardButton(
+                    text=person.full_name[:40],
+                    callback_data=f"ntc_person:{person.id}",
+                )
+            ]
+            for person in people[:40]
+        ]
+    )
+    if not buttons:
+        await message.answer("Некому отправить: нет групп и людей с Telegram.")
+        return
+    await message.answer(
+        "Кому сообщение:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+    )
+
+
+@router.callback_query(F.data.startswith("ntc_grp:"))
+async def cb_notice_group(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.from_user is None or query.message is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, query.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await query.answer(REFUSAL, show_alert=True)
+            return
+    await state.set_state(NoticeFSM.text)
+    await state.update_data(group_id=group_id, person_id=None)
+    await query.answer()
+    await query.message.answer("Текст сообщения:")
+
+
+@router.callback_query(F.data.startswith("ntc_person:"))
+async def cb_notice_person(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.from_user is None or query.message is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, query.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await query.answer(REFUSAL, show_alert=True)
+            return
+    await state.set_state(NoticeFSM.text)
+    await state.update_data(person_id=person_id, group_id=None)
+    await query.answer()
+    await query.message.answer("Текст сообщения:")
+
+
+@router.message(NoticeFSM.text)
+async def fsm_notice_text(message: Message, state: FSMContext) -> None:
+    if message.text is None or message.from_user is None or message.bot is None:
+        return
+    data = await state.get_data()
+    async with async_session_maker() as session:
+        admin = await _person_by_telegram(session, message.from_user.id)
+        if admin is None or not _is_admin(admin):
+            await message.answer(REFUSAL)
+            await state.clear()
+            return
+        if data.get("group_id"):
+            audience = await group_audience(session, data["group_id"])
+        elif data.get("person_id"):
+            person = await session.get(Person, data["person_id"])
+            audience = [person] if person is not None else []
+        else:
+            audience = []
+    report = await _send_notice(message.bot, audience, free_notice_text(message.text))
+    await state.clear()
+    await message.answer(report)
 
 
 @router.message(F.text == BTN_ADMINS)
