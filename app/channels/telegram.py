@@ -1727,34 +1727,53 @@ async def menu_roster(message: Message, state: FSMContext) -> None:
     )
 
 
-@router.message(RosterFSM.active, F.photo)
-async def fsm_roster_photo(message: Message, state: FSMContext) -> None:
-    if message.from_user is None or not message.photo:
-        return
+async def _apply_roster_image(
+    message: Message, state: FSMContext, image_bytes: bytes, mime: str
+) -> None:
     data = await state.get_data()
-    group_id = data.get("group_id")
-    if not group_id:
+    if not data.get("group_id"):
         await message.answer("Сначала выберите или создайте группу.")
         return
-    photo = message.photo[-1]
-    file = await message.bot.get_file(photo.file_id)
-    downloaded = await message.bot.download_file(file.file_path)
-    image_bytes = downloaded.read()
     try:
-        lines = await extract_roster_lines(image_bytes, "image/jpeg")
-    except RuntimeError as exc:
-        if str(exc) == "ocr_not_configured":
-            await message.answer(
-                "Распознавание фото не настроено. Введите состав текстом — по строке на человека."
-            )
-            return
-        raise
+        lines = await extract_roster_lines(image_bytes, mime)
+    except Exception:
+        logger.exception("Roster image OCR failed")
+        await message.answer(
+            "Не удалось прочитать изображение. Пришлите более чёткий снимок "
+            "или введите состав текстом — по строке на человека."
+        )
+        return
     drafts = []
     for line in lines:
         for item in parse_roster_line(line):
             drafts.append(_roster_draft_to_dict(item))
     await state.update_data(drafts=drafts)
     await message.answer(_format_roster_preview(drafts))
+
+
+@router.message(RosterFSM.active, F.photo)
+async def fsm_roster_photo(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or not message.photo or message.bot is None:
+        return
+    photo = message.photo[-1]
+    file = await message.bot.get_file(photo.file_id)
+    downloaded = await message.bot.download_file(file.file_path)
+    await _apply_roster_image(message, state, downloaded.read(), "image/jpeg")
+
+
+@router.message(RosterFSM.active, F.document)
+async def fsm_roster_document(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or message.document is None or message.bot is None:
+        return
+    mime = message.document.mime_type or ""
+    if not mime.startswith("image/"):
+        await message.answer(
+            "Пришлите фото списка или файл изображения. Другие файлы бот не читает."
+        )
+        return
+    file = await message.bot.get_file(message.document.file_id)
+    downloaded = await message.bot.download_file(file.file_path)
+    await _apply_roster_image(message, state, downloaded.read(), mime)
 
 
 @router.message(RosterFSM.active, F.text)

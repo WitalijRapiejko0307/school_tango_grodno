@@ -18,6 +18,8 @@ dependencies = [
     "alembic>=1.14.0",
     "pydantic-settings>=2.6.0",
     "httpx>=0.28.0",
+    "pillow>=11.0.0",
+    "pytesseract>=0.3.13",
 ]
 
 [project.optional-dependencies]

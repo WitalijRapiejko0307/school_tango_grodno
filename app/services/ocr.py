@@ -1,6 +1,12 @@
-"""Vision API roster line extraction."""
+"""Roster line extraction from a photo.
 
+Uses a vision API when VISION_API_KEY and VISION_API_URL are set.
+Otherwise reads the image locally with Tesseract (rus+eng).
+"""
+
+import asyncio
 import base64
+import io
 
 import httpx
 
@@ -12,11 +18,23 @@ _ROSTER_PROMPT = (
 )
 
 
+def _tesseract_lines(image_bytes: bytes) -> list[str]:
+    import pytesseract
+    from PIL import Image
+
+    image = Image.open(io.BytesIO(image_bytes))
+    text = pytesseract.image_to_string(image, lang="rus+eng")
+    return [line.strip() for line in text.splitlines() if line.strip()]
+
+
 async def extract_roster_lines(image_bytes: bytes, mime: str) -> list[str]:
     settings = get_settings()
-    if not settings.VISION_API_KEY or not settings.VISION_API_URL:
-        raise RuntimeError("ocr_not_configured")
+    if settings.VISION_API_KEY and settings.VISION_API_URL:
+        return await _vision_lines(image_bytes, mime, settings)
+    return await asyncio.to_thread(_tesseract_lines, image_bytes)
 
+
+async def _vision_lines(image_bytes: bytes, mime: str, settings) -> list[str]:
     data_url = f"data:{mime};base64,{base64.b64encode(image_bytes).decode('ascii')}"
     payload = {
         "model": settings.VISION_MODEL,
