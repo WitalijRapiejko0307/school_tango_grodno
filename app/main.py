@@ -84,6 +84,12 @@ async def lifespan(app: FastAPI):
                     "ON persons (name_key)"
                 )
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE subscriptions "
+                    "ALTER COLUMN valid_until DROP NOT NULL"
+                )
+            )
             has_alembic = await conn.execute(
                 text(
                     "SELECT 1 FROM information_schema.tables "
@@ -100,8 +106,8 @@ async def lifespan(app: FastAPI):
         if has_alembic.first() is not None:
             await conn.execute(
                 text(
-                    "UPDATE alembic_version SET version_num = 'b7c8d9e0f1a2' "
-                    "WHERE version_num = 'a1b2c3d4e5f6'"
+                    "UPDATE alembic_version SET version_num = 'c8d9e0f1a2b3' "
+                    "WHERE version_num IN ('a1b2c3d4e5f6', 'b7c8d9e0f1a2')"
                 )
             )
 

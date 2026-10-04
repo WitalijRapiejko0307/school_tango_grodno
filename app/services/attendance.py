@@ -1,5 +1,6 @@
 """Attendance application services."""
 
+from datetime import timedelta
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
@@ -76,6 +77,13 @@ async def mark_attendance(
 
     sub = await active_subscription(session, person_id, on_date)
     if sub is not None:
+        if sub.valid_until is None:
+            from app.models import Product
+
+            product = await session.get(Product, sub.product_id)
+            if product is None or product.validity_days is None:
+                raise ValueError("subscription product")
+            sub.valid_until = on_date + timedelta(days=product.validity_days)
         sub.lessons_left = max(0, sub.lessons_left - 1)
         await session.flush()
         return attendance

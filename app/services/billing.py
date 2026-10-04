@@ -1,6 +1,6 @@
 """Billing application services (products, prices, subscriptions)."""
 
-from datetime import date, timedelta
+from datetime import date
 from decimal import Decimal
 
 from sqlalchemy import select
@@ -80,12 +80,12 @@ async def open_subscription(
     if product.lessons_count is None or product.validity_days is None:
         raise ValueError("subscription product missing lessons_count or validity_days")
 
-    valid_until = started_on + timedelta(days=product.validity_days)
+    del started_on
     subscription = Subscription(
         person_id=person_id,
         product_id=product_id,
         lessons_left=product.lessons_count,
-        valid_until=valid_until,
+        valid_until=None,
     )
     session.add(subscription)
     await session.flush()
@@ -100,9 +100,10 @@ async def active_subscription(
         .where(
             Subscription.person_id == person_id,
             Subscription.lessons_left > 0,
-            Subscription.valid_until >= on_date,
+            (Subscription.valid_until.is_(None))
+            | (Subscription.valid_until >= on_date),
         )
-        .order_by(Subscription.valid_until.asc())
+        .order_by(Subscription.valid_until.asc().nullsfirst())
         .limit(1)
     )
     return result.scalar_one_or_none()

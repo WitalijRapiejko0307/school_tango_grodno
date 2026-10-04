@@ -78,6 +78,7 @@ async def test_admin_then_client_mark_admin_wins_single_lesson_decrement(
 
     await db_session.refresh(sub)
     assert sub.lessons_left == 4
+    assert sub.valid_until == date(2026, 5, 10)
 
 
 async def test_drop_in_charge_uses_price_on_session_end_date(

@@ -96,4 +96,4 @@ async def test_open_subscription_sets_lessons_and_validity(
         db_session, person.id, product.id, started_on=date(2026, 1, 1)
     )
     assert sub.lessons_left == 8
-    assert sub.valid_until == date(2026, 3, 2)
+    assert sub.valid_until is None

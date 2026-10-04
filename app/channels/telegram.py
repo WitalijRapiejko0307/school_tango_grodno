@@ -1453,7 +1453,9 @@ async def cb_open_sub_product(query: CallbackQuery, state: FSMContext) -> None:
     await state.clear()
     await query.answer("Выдано")
     if query.message:
-        await query.message.answer("Абонемент выдан.")
+        await query.message.answer(
+            "Абонемент выдан. Срок начнётся с первого посещения."
+        )
 
 
 @router.callback_query(F.data.startswith("new_price_p:"))
@@ -2306,7 +2308,14 @@ async def menu_balance(message: Message) -> None:
             await message.answer("нет абонемента")
         else:
             await message.answer(
-                f"Осталось занятий: {sub.lessons_left}, действует до {format_school_date(sub.valid_until)}"
+                (
+                    f"Осталось занятий: {sub.lessons_left}. "
+                    + (
+                        f"Действует до {format_school_date(sub.valid_until)}."
+                        if sub.valid_until is not None
+                        else "Срок начнётся с первого посещения."
+                    )
+                )
             )
 
 

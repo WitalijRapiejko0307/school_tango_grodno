@@ -209,7 +209,7 @@ class Subscription(Base):
         String(36), ForeignKey("products.id"), nullable=False
     )
     lessons_left: Mapped[int] = mapped_column(Integer, nullable=False)
-    valid_until: Mapped[date] = mapped_column(Date, nullable=False)
+    valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
