@@ -332,6 +332,9 @@ def _attendance_list_text(
 ) -> str:
     lines = [f"Отметка: {group_name}, {when}", ""]
     for person, att in members:
+        if person.telegram_user_id is None:
+            lines.append(f"· {person.full_name} — ещё не в боте")
+            continue
         mark = "✓" if att is not None else "·"
         src = f" ({att.source})" if att else ""
         lines.append(f"{mark} {person.full_name}{src}")
@@ -345,6 +348,8 @@ def _attendance_keyboard(
 ) -> InlineKeyboardMarkup:
     buttons = []
     for person, att in members:
+        if person.telegram_user_id is None:
+            continue
         mark = "✓ " if att else ""
         buttons.append(
             [
@@ -544,7 +549,9 @@ async def _client_mark_yes(
     existing = att_before.scalar_one_or_none()
     if existing is not None and existing.source == "admin":
         return "Уже отмечено администратором."
-    await mark_attendance(session, person_id, school_session_id, "client")
+    await mark_attendance(
+        session, person_id, school_session_id, "client", marked_by_id=person_id
+    )
     return "Отметили по вашему ответу."
 
 
@@ -1131,7 +1138,13 @@ async def cb_admin_toggle_att(query: CallbackQuery) -> None:
         if existing is not None:
             await session.delete(existing)
         else:
-            await mark_attendance(session, person_id, school_session_id, "admin")
+            await mark_attendance(
+                session,
+                person_id,
+                school_session_id,
+                "admin",
+                marked_by_id=admin.id,
+            )
         sess_result = await session.execute(
             select(SchoolSession).where(SchoolSession.id == school_session_id)
         )

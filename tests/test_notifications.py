@@ -301,7 +301,9 @@ async def test_attendance_ask_skipped_when_already_marked(
     drop_in = await create_product(db_session, "drop_in", "Visit")
     await set_price(db_session, drop_in.id, Decimal("15.00"), date(2026, 1, 1))
     await record_coming(db_session, person.id, school_session.id, starts - timedelta(hours=1))
-    await mark_attendance(db_session, person.id, school_session.id, "admin")
+    await mark_attendance(
+        db_session, person.id, school_session.id, "admin", marked_by_id=person.id
+    )
 
     due = await plan_due(db_session, ends + timedelta(minutes=1))
     assert not [
@@ -368,7 +370,9 @@ async def test_answer_yes_when_admin_already_marked(
     )
     drop_in = await create_product(db_session, "drop_in", "Visit")
     await set_price(db_session, drop_in.id, Decimal("10.00"), date(2026, 1, 1))
-    await mark_attendance(db_session, person.id, school_session.id, "admin")
+    await mark_attendance(
+        db_session, person.id, school_session.id, "admin", marked_by_id=person.id
+    )
 
     db_session.add(
         Reminder(

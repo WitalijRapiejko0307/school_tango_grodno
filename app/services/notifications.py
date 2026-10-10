@@ -266,6 +266,9 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
             )
         )
         for membership in memberships.scalars().all():
+            member = await session.get(Person, membership.person_id)
+            if member is None or member.telegram_user_id is None:
+                continue
             reminder = await _find_reminder(
                 session,
                 membership.person_id,
@@ -298,6 +301,9 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
         )
     )
     for start_reminder, school_session in coming_result.all():
+        member = await session.get(Person, start_reminder.person_id)
+        if member is None or member.telegram_user_id is None:
+            continue
         if _as_aware(school_session.ends_at) > _as_aware(now):
             continue
         if await _already_marked(session, start_reminder.person_id, school_session.id):
@@ -610,7 +616,9 @@ async def answer_attendance(
         await session.flush()
         return "Уже отмечено администратором."
 
-    await mark_attendance(session, person_id, school_session_id, "client")
+    await mark_attendance(
+        session, person_id, school_session_id, "client", marked_by_id=person_id
+    )
     reminder.response = ReminderResponse.ATTENDED_YES
     await session.flush()
     return "Отметили по вашему ответу."
@@ -660,6 +668,9 @@ async def build_admin_session_summary_text(
         )
     )
     for membership in memberships.scalars().all():
+        member = await session.get(Person, membership.person_id)
+        if member is None or member.telegram_user_id is None:
+            continue
         reminder = await _find_reminder(
             session,
             membership.person_id,

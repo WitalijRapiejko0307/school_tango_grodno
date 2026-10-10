@@ -228,6 +228,9 @@ class Attendance(Base):
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("school_sessions.id"), nullable=False
     )
+    marked_by_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("persons.id"), nullable=True
+    )
     source: Mapped[str] = mapped_column(String(16), nullable=False)
     marked_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

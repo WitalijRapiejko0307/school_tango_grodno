@@ -80,6 +80,7 @@ async def test_attendance_unique_per_person_and_session(
     first = Attendance(
         person_id=person.id,
         session_id=school_session.id,
+        marked_by_id=person.id,
         source="admin",
         marked_at=datetime(2026, 5, 1, 20, 0, tzinfo=timezone.utc),
     )
@@ -89,6 +90,7 @@ async def test_attendance_unique_per_person_and_session(
     duplicate = Attendance(
         person_id=person.id,
         session_id=school_session.id,
+        marked_by_id=person.id,
         source="client",
         marked_at=datetime(2026, 5, 1, 21, 0, tzinfo=timezone.utc),
     )

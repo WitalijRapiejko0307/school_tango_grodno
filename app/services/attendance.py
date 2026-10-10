@@ -1,13 +1,13 @@
 """Attendance application services."""
 
-from datetime import timedelta
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import Attendance, DropInCharge, SchoolSession
+from app.models import Attendance, DropInCharge, Person, SchoolSession
 from app.services.billing import active_subscription, current_price
 
 
@@ -37,9 +37,21 @@ async def mark_attendance(
     person_id: str,
     school_session_id: str,
     source: str,
+    marked_by_id: str,
 ) -> Attendance:
     if source not in ("admin", "client"):
         raise ValueError("source must be admin or client")
+
+    person = await session.get(Person, person_id)
+    if person is None or person.telegram_user_id is None:
+        raise ValueError("person is not activated")
+
+    session_result = await session.execute(
+        select(SchoolSession).where(SchoolSession.id == school_session_id)
+    )
+    school_session = session_result.scalar_one()
+    if school_session.status != "scheduled":
+        raise ValueError("session is not scheduled")
 
     result = await session.execute(
         select(Attendance).where(
@@ -56,6 +68,8 @@ async def mark_attendance(
             return existing
         if existing.source == "client" and source == "admin":
             existing.source = "admin"
+            existing.marked_by_id = marked_by_id
+            existing.marked_at = datetime.now(timezone.utc)
             await session.flush()
             return existing
         return existing
@@ -63,15 +77,12 @@ async def mark_attendance(
     attendance = Attendance(
         person_id=person_id,
         session_id=school_session_id,
+        marked_by_id=marked_by_id,
         source=source,
     )
     session.add(attendance)
     await session.flush()
 
-    session_result = await session.execute(
-        select(SchoolSession).where(SchoolSession.id == school_session_id)
-    )
-    school_session = session_result.scalar_one()
     tz_name = get_settings().SCHOOL_TZ
     on_date = _session_local_date(school_session.ends_at, tz_name)
 
