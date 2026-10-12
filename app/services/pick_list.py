@@ -4,10 +4,12 @@ from dataclasses import dataclass
 
 PAGE_SIZE = 20
 
+HINT_INDEX = "Отправьте номер из списка."
 HINT_ONE = "Отправьте номер из списка или имя и фамилию целиком."
 HINT_MANY = (
     "Отправьте номера через запятую или имена и фамилии целиком через запятую."
 )
+MORE_HINT = "Кнопка «Дальше» покажет следующие."
 
 
 @dataclass(frozen=True)
@@ -45,9 +47,12 @@ def page_text(rows: list[PickRow], page: int, hint: str) -> str:
     slice_rows = rows[start:end]
     lines = [_format_row_line(start + i + 1, row) for i, row in enumerate(slice_rows)]
     body = "\n".join(lines)
+    display_hint = hint
+    if has_next_page(rows, page):
+        display_hint = f"{hint} {MORE_HINT}"
     if body:
-        return f"{body}\n\n{hint}"
-    return hint
+        return f"{body}\n\n{display_hint}"
+    return display_hint
 
 
 def has_next_page(rows: list[PickRow], page: int) -> bool:

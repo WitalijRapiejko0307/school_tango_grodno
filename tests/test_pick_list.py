@@ -3,6 +3,7 @@ import pytest
 from app.services.pick_list import (
     HINT_MANY,
     HINT_ONE,
+    MORE_HINT,
     PAGE_SIZE,
     PickError,
     PickRow,
@@ -48,6 +49,12 @@ def test_page_omits_detail_when_empty() -> None:
     assert "1. Ivanov Ivan — Beginners" in text
     assert "2. Petrova Anna\n" in text or "2. Petrova Anna\n\n" in text
     assert "Petrova Anna —" not in text
+
+
+def test_non_final_page_appends_more_hint() -> None:
+    rows = _rows(PAGE_SIZE + 1)
+    text = page_text(rows, page=0, hint=HINT_ONE)
+    assert text.endswith(f"{HINT_ONE} {MORE_HINT}")
 
 
 def test_has_next_page() -> None:

@@ -103,6 +103,7 @@ from app.services.roster import (
     update_person_card,
 )
 from app.services.pick_list import (
+    HINT_INDEX,
     HINT_MANY,
     HINT_ONE,
     PickError,
@@ -401,41 +402,6 @@ async def _members_with_attendance(
     return out
 
 
-def _attendance_list_text(
-    members: list[tuple[Person, Attendance | None]], group_name: str, when: str
-) -> str:
-    lines = [f"Отметка: {group_name}, {when}", ""]
-    for person, att in members:
-        if person.telegram_user_id is None:
-            lines.append(f"· {person.full_name} — ещё не в боте")
-            continue
-        mark = "✓" if att is not None else "·"
-        src = f" ({att.source})" if att else ""
-        lines.append(f"{mark} {person.full_name}{src}")
-    lines.append("")
-    lines.append("Нажмите имя, чтобы переключить отметку.")
-    return "\n".join(lines)
-
-
-def _attendance_keyboard(
-    school_session_id: str, members: list[tuple[Person, Attendance | None]]
-) -> InlineKeyboardMarkup:
-    buttons = []
-    for person, att in members:
-        if person.telegram_user_id is None:
-            continue
-        mark = "✓ " if att else ""
-        buttons.append(
-            [
-                InlineKeyboardButton(
-                    text=f"{mark}{person.full_name}",
-                    callback_data=f"adm_att:{school_session_id}:{person.id}",
-                )
-            ]
-        )
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
-
-
 def _attendance_pick_rows(
     members: list[tuple[Person, Attendance | None]],
 ) -> list[PickRow]:
@@ -451,10 +417,40 @@ def _attendance_pick_rows(
     return rows
 
 
+_LIST_PICK_INDEX_PURPOSES = frozenset(
+    {
+        "grp",
+        "prd",
+        "today",
+        "sess",
+        "slot_week",
+        "slot_once",
+        "grp_slot",
+        "grp_roster",
+        "grp_stream",
+        "grp_assign",
+    }
+)
+
+
 def _list_pick_more_callback(purpose: str) -> str:
     if purpose.startswith("att:"):
         return "att_more"
+    if purpose == "grp":
+        return "grp_more"
+    if purpose == "prd":
+        return "prd_more"
+    if purpose == "today":
+        return "today_more"
+    if purpose in _LIST_PICK_INDEX_PURPOSES:
+        return f"{purpose}_more"
     return "msg_more"
+
+
+def _list_pick_hint(purpose: str) -> str:
+    if purpose in _LIST_PICK_INDEX_PURPOSES:
+        return HINT_INDEX
+    return HINT_MANY
 
 
 def _list_pick_keyboard(rows: list[PickRow], page: int, purpose: str) -> InlineKeyboardMarkup | None:
@@ -464,7 +460,7 @@ def _list_pick_keyboard(rows: list[PickRow], page: int, purpose: str) -> InlineK
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="ещё",
+                    text="Дальше",
                     callback_data=_list_pick_more_callback(purpose),
                 )
             ]
@@ -559,6 +555,57 @@ async def _list_pick_rows_from_data(
             _rem, person, detail = entry
             rows.append(PickRow(id=_rem.id, full_name=person.full_name, detail=detail))
         return rows
+    if purpose == "grp":
+        rows = []
+        for group_id in pick_ids:
+            group = await session.get(Group, group_id)
+            if group is not None and group.archived_at is None:
+                rows.append(PickRow(id=group.id, full_name=group.name))
+        return rows
+    if purpose == "prd":
+        rows = []
+        for product_id in pick_ids:
+            product = await session.get(Product, product_id)
+            if product is not None and product.active:
+                rows.append(PickRow(id=product.id, full_name=product.name))
+        return rows
+    if purpose in ("today", "sess"):
+        rows = []
+        for school_session_id in pick_ids:
+            school_session = await session.get(SchoolSession, school_session_id)
+            if school_session is None:
+                continue
+            gname = await _session_group_name(session, school_session.group_id)
+            detail = (
+                f"{format_school_datetime(school_session.starts_at)}, "
+                f"{school_session.place}"
+            )
+            rows.append(PickRow(id=school_session.id, full_name=gname, detail=detail))
+        return rows
+    if purpose in ("slot_week", "slot_once"):
+        rows = []
+        for slot_id in pick_ids:
+            slot = await session.get(WeeklySlot, slot_id)
+            if slot is None or not slot.active:
+                continue
+            group = await session.get(Group, slot.group_id)
+            if group is None or group.archived_at is not None:
+                continue
+            detail = (
+                f"{WEEKDAY_LABELS[slot.weekday]} "
+                f"{slot.start_time.strftime('%H:%M')}, {slot.place}"
+            )
+            if slot.notes:
+                detail = f"{detail} ({slot.notes})"
+            rows.append(PickRow(id=slot.id, full_name=group.name, detail=detail))
+        return rows
+    if purpose in ("grp_slot", "grp_roster", "grp_stream", "grp_assign"):
+        rows = []
+        for group_id in pick_ids:
+            group = await session.get(Group, group_id)
+            if group is not None and group.archived_at is None:
+                rows.append(PickRow(id=group.id, full_name=group.name))
+        return rows
     return []
 
 
@@ -650,7 +697,7 @@ def _people_pick_keyboard(rows: list[PickRow], page: int) -> InlineKeyboardMarku
         return None
     return InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="ещё", callback_data="pp_more")]
+            [InlineKeyboardButton(text="Дальше", callback_data="pp_more")]
         ]
     )
 
@@ -692,15 +739,16 @@ async def _prompt_assign_group(
     if not groups:
         await message.answer("Нет групп")
         return
-    await state.set_state(AssignGroupFSM.group_id)
     await state.update_data(person_id=person_id)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=g.name, callback_data=f"assign_grp:{g.id}")]
-            for g in groups
-        ]
+    rows = [PickRow(id=g.id, full_name=g.name) for g in groups]
+    await _start_list_pick(
+        message,
+        state,
+        purpose="grp_assign",
+        rows=rows,
+        title="Номер выберет группу.",
+        hint=HINT_INDEX,
     )
-    await message.answer("Выберите группу:", reply_markup=kb)
 
 
 async def _prompt_open_sub_products(
@@ -837,6 +885,148 @@ async def _stream_pick_keyboard(
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+async def _finish_assign_group_message(
+    message: Message,
+    state: FSMContext,
+    person_id: str,
+    group_id: str,
+) -> None:
+    today = _today_local()
+    guest_notify_id: int | None = None
+    transfer_notify: tuple[int, str, str, str | None] | None = None
+    async with async_session_maker() as session:
+        target = await session.get(Person, person_id)
+        was_guest = target is not None and target.role == "guest"
+        prev_membership = await _active_membership(session, person_id)
+        old_group_name: str | None = None
+        if prev_membership is not None:
+            old_group_name = await _session_group_name(
+                session, prev_membership.group_id
+            )
+        new_group_name = await _session_group_name(session, group_id)
+        await assign_group(session, person_id, group_id, today)
+        if (
+            target is not None
+            and target.telegram_user_id is not None
+            and prev_membership is not None
+            and old_group_name is not None
+        ):
+            await materialize_range(session, today, today + timedelta(days=21))
+            now = datetime.now(UTC)
+            next_result = await session.execute(
+                select(SchoolSession)
+                .where(
+                    SchoolSession.group_id == group_id,
+                    SchoolSession.starts_at > now,
+                    SchoolSession.status == "scheduled",
+                )
+                .order_by(SchoolSession.starts_at)
+                .limit(1)
+            )
+            nxt = next_result.scalar_one_or_none()
+            next_line: str | None = None
+            if nxt is not None:
+                next_line = (
+                    f"Ближайшее занятие: {format_school_datetime(nxt.starts_at)}, "
+                    f"{nxt.place}"
+                )
+            transfer_notify = (
+                target.telegram_user_id,
+                old_group_name,
+                new_group_name,
+                next_line,
+            )
+        elif (
+            was_guest
+            and prev_membership is None
+            and target is not None
+            and target.telegram_user_id is not None
+        ):
+            guest_notify_id = target.telegram_user_id
+        await session.commit()
+    await state.clear()
+    await message.answer("Человек назначен в группу.")
+    if guest_notify_id is not None and message.bot is not None:
+        try:
+            await message.bot.send_message(
+                guest_notify_id,
+                "Вас записали в группу. Теперь вы клиент школы.",
+                reply_markup=reply_markup_for_role("client"),
+            )
+        except Exception:
+            logger.exception("Failed to refresh client menu for %s", guest_notify_id)
+    if transfer_notify is not None and message.bot is not None:
+        tid, from_name, to_name, next_line = transfer_notify
+        lines = [
+            f"Вас перевели из группы «{from_name}» в группу «{to_name}».",
+        ]
+        if next_line is not None:
+            lines.append(next_line)
+        try:
+            await message.bot.send_message(tid, "\n".join(lines))
+        except Exception:
+            logger.exception("Failed to notify group transfer for %s", tid)
+
+
+async def _apply_assign_group_choice(
+    message: Message, state: FSMContext, group_id: str
+) -> None:
+    data = await state.get_data()
+    person_id = data.get("person_id")
+    if not person_id:
+        await message.answer("Сначала выберите человека")
+        return
+    async with async_session_maker() as session:
+        target = await session.get(Person, person_id)
+        new_group = await session.get(Group, group_id)
+        if target is None or new_group is None:
+            await message.answer("Не найдено")
+            return
+        membership = await _active_membership(session, person_id)
+        if membership is not None and membership.group_id == group_id:
+            await message.answer("Уже в этой группе")
+            return
+        if membership is not None:
+            old_group = await session.get(Group, membership.group_id)
+            if old_group is None:
+                await message.answer("Ошибка")
+                return
+            text = group_transfer_confirmation_text(
+                target.full_name,
+                old_group.name,
+                membership.started_on,
+                new_group.name,
+            )
+            kb = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Перевести",
+                            callback_data=f"assign_go:{person_id}:{group_id}",
+                        )
+                    ],
+                    [
+                        InlineKeyboardButton(
+                            text="Отмена", callback_data="assign_cancel"
+                        )
+                    ],
+                ]
+            )
+            await message.answer(text, reply_markup=kb)
+            return
+    await _finish_assign_group_message(message, state, person_id, group_id)
+
+
+async def _begin_roster_group(
+    message: Message, state: FSMContext, group_id: str
+) -> None:
+    await state.set_state(RosterFSM.active)
+    await state.update_data(group_id=group_id, drafts=[])
+    await message.answer(
+        "Пришлите строки состава (по одному человеку на строку) или фото списка."
+    )
+
+
 async def _finish_assign_group(
     query: CallbackQuery,
     state: FSMContext,
@@ -939,7 +1129,7 @@ def _contact_card_text(card: ContactCard) -> str:
 async def _admins_menu_keyboard(session: AsyncSession) -> InlineKeyboardMarkup:
     rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="Добавить админа", callback_data="admin_invite")],
-        [InlineKeyboardButton(text="Контакт", callback_data="admin_contact")],
+        [InlineKeyboardButton(text="Новый контакт", callback_data="admin_contact")],
     ]
     admins = list(
         (
@@ -966,7 +1156,7 @@ async def _admins_menu_keyboard(session: AsyncSession) -> InlineKeyboardMarkup:
                 )
             ]
         )
-    rows.append([InlineKeyboardButton(text="Архив", callback_data="ctc_arch")])
+    rows.append([InlineKeyboardButton(text="Архив контактов", callback_data="ctc_arch")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
@@ -1570,6 +1760,31 @@ async def cb_rsvp(query: CallbackQuery) -> None:
         await query.message.answer("Вы записаны на занятие.")
 
 
+async def _start_admin_attendance_pick(
+    message: Message,
+    state: FSMContext,
+    school_session_id: str,
+) -> None:
+    async with async_session_maker() as session:
+        school_session = await session.get(SchoolSession, school_session_id)
+        if school_session is None:
+            await message.answer("Не найдено")
+            return
+        members = await _members_with_attendance(
+            session, school_session.group_id, school_session_id
+        )
+        rows = _attendance_pick_rows(members)
+        title = "У выбранных номеров переключится отметка"
+        purpose = f"att:{school_session_id}"
+    await _start_list_pick(
+        message,
+        state,
+        purpose=purpose,
+        rows=rows,
+        title=title,
+    )
+
+
 @router.callback_query(F.data.startswith("adm_sess:"))
 async def cb_admin_session(
     query: CallbackQuery, state: FSMContext
@@ -1581,83 +1796,11 @@ async def cb_admin_session(
     if person is None or not _is_admin(person):
         await query.answer(REFUSAL, show_alert=True)
         return
-    async with async_session_maker() as session:
-        sess_result = await session.execute(
-            select(SchoolSession).where(SchoolSession.id == school_session_id)
-        )
-        school_session = sess_result.scalar_one()
-        group_name = await _session_group_name(session, school_session.group_id)
-        members = await _members_with_attendance(
-            session, school_session.group_id, school_session_id
-        )
-        rows = _attendance_pick_rows(members)
-        title = (
-            f"Отметка: {group_name}, "
-            f"{format_school_datetime(school_session.starts_at)}"
-        )
-        purpose = f"att:{school_session_id}"
     await query.answer()
     if query.message:
-        await _start_list_pick(
-            query.message,
-            state,
-            purpose=purpose,
-            rows=rows,
-            title=title,
+        await _start_admin_attendance_pick(
+            query.message, state, school_session_id
         )
-
-
-@router.callback_query(F.data.startswith("adm_att:"))
-async def cb_admin_toggle_att(query: CallbackQuery) -> None:
-    if query.data is None:
-        return
-    parts = query.data.split(":")
-    if len(parts) != 3:
-        return
-    _, school_session_id, person_id = parts
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
-        return
-    async with async_session_maker() as session:
-        att_result = await session.execute(
-            select(Attendance).where(
-                Attendance.person_id == person_id,
-                Attendance.session_id == school_session_id,
-            )
-        )
-        existing = att_result.scalar_one_or_none()
-        if existing is not None:
-            await session.delete(existing)
-        else:
-            await mark_attendance(
-                session,
-                person_id,
-                school_session_id,
-                "admin",
-                marked_by_id=admin.id,
-            )
-        sess_result = await session.execute(
-            select(SchoolSession).where(SchoolSession.id == school_session_id)
-        )
-        school_session = sess_result.scalar_one()
-        group_name = await _session_group_name(session, school_session.group_id)
-        members = await _members_with_attendance(
-            session, school_session.group_id, school_session_id
-        )
-        await session.commit()
-        rows = _attendance_pick_rows(members)
-        title = (
-            f"Отметка: {group_name}, "
-            f"{format_school_datetime(school_session.starts_at)}"
-        )
-        purpose = f"att:{school_session_id}"
-        body = page_text(rows, 0, HINT_MANY)
-        text = f"{title}\n\n{body}"
-        kb = _list_pick_keyboard(rows, 0, purpose)
-    await query.answer()
-    if query.message:
-        await query.message.edit_text(text, reply_markup=kb)
 
 
 async def _complete_other_group_visit(
@@ -1800,20 +1943,6 @@ async def cb_pick_group_slot(query: CallbackQuery, state: FSMContext) -> None:
             "День недели:",
             reply_markup=_weekday_keyboard("wday"),
         )
-
-
-@router.callback_query(F.data.startswith("pick_person:"))
-async def cb_pick_person_assign(query: CallbackQuery, state: FSMContext) -> None:
-    if query.data is None:
-        return
-    person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
-        return
-    await query.answer()
-    if query.message:
-        await _prompt_assign_group(query.message, state, person_id)
 
 
 @router.callback_query(F.data.startswith("assign_grp:"))
@@ -1975,15 +2104,17 @@ async def cb_admin_slot(query: CallbackQuery, state: FSMContext) -> None:
     if not groups:
         await query.answer("Сначала создайте группу", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text=g.name, callback_data=f"pick_grp:{g.id}")]
-            for g in groups
-        ]
-    )
+    rows = [PickRow(id=g.id, full_name=g.name) for g in groups]
     await query.answer()
     if query.message:
-        await query.message.answer("Выберите группу для слота:", reply_markup=kb)
+        await _start_list_pick(
+            query.message,
+            state,
+            purpose="grp_slot",
+            rows=rows,
+            title="Номер выберет группу.",
+            hint=HINT_INDEX,
+        )
 
 
 @router.callback_query(F.data == "people_assign")
@@ -2004,7 +2135,7 @@ async def cb_people_assign(query: CallbackQuery, state: FSMContext) -> None:
             state,
             purpose="assign",
             rows=rows,
-            title="Выберите человека:",
+            title="Запись в группу по номеру.",
         )
 
 
@@ -2026,7 +2157,7 @@ async def cb_people_card(query: CallbackQuery, state: FSMContext) -> None:
             state,
             purpose="card",
             rows=rows,
-            title="Карточка — выберите человека:",
+            title="Откроется карточка клиента по номеру.",
         )
 
 
@@ -2048,11 +2179,28 @@ async def cb_people_leave(query: CallbackQuery, state: FSMContext) -> None:
             state,
             purpose="leave",
             rows=rows,
-            title="Из группы — выберите человека:",
+            title="Удаление из группы по номеру.",
         )
 
 
-@router.callback_query(F.data.in_(("att_more", "msg_more")))
+@router.callback_query(
+    F.data.in_(
+        (
+            "att_more",
+            "msg_more",
+            "grp_more",
+            "prd_more",
+            "today_more",
+            "sess_more",
+            "slot_week_more",
+            "slot_once_more",
+            "grp_slot_more",
+            "grp_roster_more",
+            "grp_stream_more",
+            "grp_assign_more",
+        )
+    )
+)
 async def cb_list_pick_more(query: CallbackQuery, state: FSMContext) -> None:
     admin = await _person_for_callback(query)
     if admin is None or not _is_admin(admin):
@@ -2078,7 +2226,7 @@ async def cb_list_pick_more(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
     if query.message:
         await query.message.answer(
-            page_text(rows, page, HINT_MANY),
+            page_text(rows, page, _list_pick_hint(purpose)),
             reply_markup=_list_pick_keyboard(rows, page, purpose),
         )
 
@@ -2197,7 +2345,7 @@ async def cb_price_open_sub(query: CallbackQuery, state: FSMContext) -> None:
             state,
             purpose="subscription",
             rows=rows,
-            title="Кому выдать абонемент?",
+            title="Выдача абонемента по номеру.",
         )
 
 
@@ -2242,6 +2390,32 @@ async def _product_card_text(session: AsyncSession, product: Product, on_date: d
     return "\n".join(lines)
 
 
+def _product_card_keyboard(product_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Изменить", callback_data=f"prd_ren:{product_id}"
+                ),
+                InlineKeyboardButton(
+                    text="Убрать из прайса", callback_data=f"prd_ask:{product_id}"
+                ),
+            ]
+        ]
+    )
+
+
+async def _send_product_card(message: Message, product_id: str) -> None:
+    today = _today_local()
+    async with async_session_maker() as session:
+        product = await session.get(Product, product_id)
+        if product is None or not product.active:
+            await message.answer("Не найдено")
+            return
+        text = await _product_card_text(session, product, today)
+    await message.answer(text, reply_markup=_product_card_keyboard(product_id))
+
+
 @router.callback_query(F.data.startswith("prd_card:"))
 async def cb_prd_card(query: CallbackQuery) -> None:
     if query.data is None:
@@ -2251,28 +2425,14 @@ async def cb_prd_card(query: CallbackQuery) -> None:
     if admin is None or not _is_admin(admin):
         await query.answer(REFUSAL, show_alert=True)
         return
-    today = _today_local()
     async with async_session_maker() as session:
         product = await session.get(Product, product_id)
         if product is None or not product.active:
             await query.answer("Не найдено", show_alert=True)
             return
-        text = await _product_card_text(session, product, today)
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Изменить", callback_data=f"prd_ren:{product_id}"
-                ),
-                InlineKeyboardButton(
-                    text="Убрать", callback_data=f"prd_ask:{product_id}"
-                ),
-            ]
-        ]
-    )
     await query.answer()
     if query.message:
-        await query.message.answer(text, reply_markup=kb)
+        await _send_product_card(query.message, product_id)
 
 
 @router.callback_query(F.data.startswith("prd_ren:"))
@@ -2662,7 +2822,7 @@ async def cb_ctc_card(query: CallbackQuery) -> None:
                     text="Изменить", callback_data=f"ctc_ren:{contact_id}"
                 ),
                 InlineKeyboardButton(
-                    text="Убрать", callback_data=f"ctc_ask:{contact_id}"
+                    text="Убрать контакт", callback_data=f"ctc_ask:{contact_id}"
                 ),
             ]
         ]
@@ -2808,7 +2968,7 @@ async def cb_ctc_restore(query: CallbackQuery) -> None:
 
 
 @router.message(F.text == BTN_TODAY)
-async def menu_today(message: Message) -> None:
+async def menu_today(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
         person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
         if person is None:
@@ -2822,60 +2982,88 @@ async def menu_today(message: Message) -> None:
         if not sessions:
             await message.answer("На сегодня занятий нет.")
             return
-        lines = ["Занятия сегодня:"]
-        buttons = []
+        rows: list[PickRow] = []
         for s in sessions:
             gname = await _session_group_name(session, s.group_id)
-            lines.append(f"• {gname} — {format_school_datetime(s.starts_at)}, {s.place}")
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"Отметить: {gname}",
-                        callback_data=f"adm_sess:{s.id}",
-                    )
-                ]
-            )
-        await message.answer("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+            detail = f"{format_school_datetime(s.starts_at)}, {s.place}"
+            rows.append(PickRow(id=s.id, full_name=gname, detail=detail))
+    await _start_list_pick(
+        message,
+        state,
+        purpose="today",
+        rows=rows,
+        title="Номер откроет отметку занятия.",
+        hint=HINT_INDEX,
+    )
+
+
+def _group_card_keyboard(group_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Изменить", callback_data=f"grp_ren:{group_id}"
+                ),
+                InlineKeyboardButton(
+                    text="Убрать группу", callback_data=f"grp_ask:{group_id}"
+                ),
+            ]
+        ]
+    )
+
+
+async def _send_group_card(message: Message, group_id: str) -> None:
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await message.answer("Не найдено")
+            return
+        name = group.name
+    await message.answer(name, reply_markup=_group_card_keyboard(group_id))
 
 
 @router.message(F.text == BTN_GROUPS)
-async def menu_groups(message: Message) -> None:
+async def menu_groups(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
         person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
         if person is None or not _is_admin(person):
             await message.answer(REFUSAL if person and not _is_admin(person) else "")
             return
         groups = await _list_active_groups(session)
-    text = "Группы:\n" + ("\n".join(f"• {g.name}" for g in groups) if groups else "пока нет")
     kb_rows: list[list[InlineKeyboardButton]] = [
         [InlineKeyboardButton(text="Новая группа", callback_data="admin_new_group")],
         [
             InlineKeyboardButton(
-                text="Поток группы", callback_data="admin_group_stream"
+                text="Задать поток", callback_data="admin_group_stream"
             )
         ],
-        [InlineKeyboardButton(text="Недельный слот", callback_data="admin_slot")],
+        [InlineKeyboardButton(text="Добавить слот", callback_data="admin_slot")],
         [
             InlineKeyboardButton(
-                text="Изменить график", callback_data="admin_edit_week"
+                text="Изменить слот на все недели", callback_data="admin_edit_week"
             ),
             InlineKeyboardButton(text="Выключить слот", callback_data="slot_off"),
         ],
-        [InlineKeyboardButton(text="Одно занятие", callback_data="admin_edit_once")],
-    ]
-    kb_rows.extend(
         [
-            [
-                InlineKeyboardButton(
-                    text=f"Группа: {g.name}", callback_data=f"grp_card:{g.id}"
-                )
-            ]
-            for g in groups
-        ]
-    )
-    kb_rows.append([InlineKeyboardButton(text="Архив", callback_data="grp_arch")])
+            InlineKeyboardButton(
+                text="Перенести или отменить одно занятие",
+                callback_data="admin_edit_once",
+            )
+        ],
+        [InlineKeyboardButton(text="Архив групп", callback_data="grp_arch")],
+    ]
     kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-    await message.answer(text, reply_markup=kb)
+    await message.answer("Группы:", reply_markup=kb)
+    if groups:
+        rows = [PickRow(id=g.id, full_name=g.name) for g in groups]
+        await _start_list_pick(
+            message,
+            state,
+            purpose="grp",
+            rows=rows,
+            title="Номер откроет карточку группы.",
+            hint=HINT_INDEX,
+        )
 
 
 @router.callback_query(F.data.startswith("grp_card:"))
@@ -2892,22 +3080,9 @@ async def cb_grp_card(query: CallbackQuery) -> None:
         if group is None or group.archived_at is not None:
             await query.answer("Не найдено", show_alert=True)
             return
-        name = group.name
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Изменить", callback_data=f"grp_ren:{group_id}"
-                ),
-                InlineKeyboardButton(
-                    text="Убрать", callback_data=f"grp_ask:{group_id}"
-                ),
-            ]
-        ]
-    )
     await query.answer()
     if query.message:
-        await query.message.answer(name, reply_markup=kb)
+        await _send_group_card(query.message, group_id)
 
 
 @router.callback_query(F.data.startswith("grp_ren:"))
@@ -3303,7 +3478,7 @@ async def menu_people(message: Message) -> None:
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [InlineKeyboardButton(text="В группу", callback_data="people_assign")],
-            [InlineKeyboardButton(text="Карточка", callback_data="ppl_card")],
+            [InlineKeyboardButton(text="Изменить карточку", callback_data="ppl_card")],
             [InlineKeyboardButton(text="Из группы", callback_data="ppl_leave")],
         ]
     )
@@ -3311,7 +3486,7 @@ async def menu_people(message: Message) -> None:
 
 
 @router.message(F.text == BTN_PRICE)
-async def menu_price(message: Message) -> None:
+async def menu_price(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
         person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
         if person is None:
@@ -3350,22 +3525,25 @@ async def menu_price(message: Message) -> None:
                     )
                 ],
             ]
-            kb_rows.extend(
-                [
-                    [
-                        InlineKeyboardButton(
-                            text=f"Продукт: {p.name}"[:64],
-                            callback_data=f"prd_card:{p.id}",
-                        )
-                    ]
-                    for p in active_products
-                ]
-            )
             kb_rows.append(
-                [InlineKeyboardButton(text="Архив", callback_data="prd_arch")]
+                [
+                    InlineKeyboardButton(
+                        text="Архив продуктов", callback_data="prd_arch"
+                    )
+                ]
             )
             kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
             await message.answer(text, reply_markup=kb)
+            if active_products:
+                prd_rows = [PickRow(id=p.id, full_name=p.name) for p in active_products]
+                await _start_list_pick(
+                    message,
+                    state,
+                    purpose="prd",
+                    rows=prd_rows,
+                    title="Номер откроет карточку продукта.",
+                    hint=HINT_INDEX,
+                )
         else:
             await message.answer(text)
 
@@ -3397,7 +3575,10 @@ async def menu_reminders(message: Message, state: FSMContext) -> None:
     body = page_text(pick_rows, 0, HINT_MANY)
     kb = _list_pick_keyboard(pick_rows, 0, "reminders")
     await message.answer(
-        f"Напоминания сегодня:\n\n{body}", reply_markup=kb
+        "Номер или несколько номеров через запятую — кому написать. "
+        "Без номера сообщение не уйдёт.\n\n"
+        f"{body}",
+        reply_markup=kb,
     )
 
 
@@ -3433,7 +3614,12 @@ async def menu_guests_summary(message: Message, state: FSMContext) -> None:
     )
     body = page_text(pick_rows, 0, HINT_MANY)
     kb = _list_pick_keyboard(pick_rows, 0, "guests")
-    await message.answer(f"Гости сегодня:\n\n{body}", reply_markup=kb)
+    await message.answer(
+        "Номер или несколько номеров через запятую — кому написать. "
+        "Без номера сообщение не уйдёт.\n\n"
+        f"{body}",
+        reply_markup=kb,
+    )
 
 
 @router.message(F.text == BTN_ROSTER)
@@ -3444,16 +3630,25 @@ async def menu_roster(message: Message, state: FSMContext) -> None:
             await message.answer(REFUSAL if person and not _is_admin(person) else "")
             return
         groups = await _list_active_groups(session)
-    await state.set_state(RosterFSM.active)
-    await state.update_data(group_id=None, drafts=[])
-    rows = [
-        [InlineKeyboardButton(text=g.name, callback_data=f"pick_roster_grp:{g.id}")]
-        for g in groups
-    ]
-    kb = InlineKeyboardMarkup(inline_keyboard=rows) if rows else None
-    await message.answer(
-        "Выберите группу для состава или напишите название новой группы.",
-        reply_markup=kb,
+    await state.clear()
+    if not groups:
+        await state.set_state(RosterFSM.active)
+        await state.update_data(group_id=None, drafts=[])
+        await message.answer(
+            "Выберите группу для состава или напишите название новой группы."
+        )
+        return
+    pick_rows = [PickRow(id=g.id, full_name=g.name) for g in groups]
+    await _start_list_pick(
+        message,
+        state,
+        purpose="grp_roster",
+        rows=pick_rows,
+        title=(
+            "Номер выберет группу.\n\n"
+            "Или напишите название новой группы."
+        ),
+        hint=HINT_INDEX,
     )
 
 
@@ -3634,28 +3829,57 @@ async def menu_sessions(message: Message, state: FSMContext) -> None:
     now = datetime.now(UTC)
     async with async_session_maker() as session:
         await materialize_range(session, today, today + timedelta(days=21))
-        rows = await upcoming_sessions(session, now)
+        upcoming = await upcoming_sessions(session, now)
         await session.commit()
-    if not rows:
+    if not upcoming:
         await message.answer("Предстоящих занятий нет.")
         return
-    buttons = []
-    for school_session, group_name in rows[:30]:
-        label = (
-            f"{group_name}, {format_school_datetime(school_session.starts_at)}, "
-            f"{school_session.place}"
+    pick_rows = [
+        PickRow(
+            id=school_session.id,
+            full_name=group_name,
+            detail=(
+                f"{format_school_datetime(school_session.starts_at)}, "
+                f"{school_session.place}"
+            ),
         )
-        buttons.append(
+        for school_session, group_name in upcoming
+    ]
+    await _start_list_pick(
+        message,
+        state,
+        purpose="sess",
+        rows=pick_rows,
+        title="Номер откроет занятие: перенос или отмена.",
+        hint=HINT_INDEX,
+    )
+
+
+async def _send_notice_session_actions(message: Message, session_id: str) -> None:
+    async with async_session_maker() as session:
+        school_session = await session.get(SchoolSession, session_id)
+        if school_session is None:
+            await message.answer("Не найдено")
+            return
+        group_name = await _session_group_name(session, school_session.group_id)
+        audience = await notice_audience(session, session_id)
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text=label[:60],
-                    callback_data=f"ntc_sess:{school_session.id}",
-                )
+                    text="Перенести", callback_data=f"ntc_move:{session_id}"
+                ),
+                InlineKeyboardButton(
+                    text="Отменить", callback_data=f"ntc_cancel:{session_id}"
+                ),
             ]
-        )
+        ]
+    )
     await message.answer(
-        "Предстоящие занятия:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        f"{group_name}, {format_school_datetime(school_session.starts_at)}, "
+        f"{school_session.place}.\n"
+        f"Сообщение уйдёт {len(audience)} чел.",
+        reply_markup=kb,
     )
 
 
@@ -3670,27 +3894,8 @@ async def cb_notice_session(query: CallbackQuery) -> None:
         if admin is None or not _is_admin(admin) or school_session is None:
             await query.answer(REFUSAL, show_alert=True)
             return
-        group_name = await _session_group_name(session, school_session.group_id)
-        audience = await notice_audience(session, session_id)
     await query.answer()
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Перенести", callback_data=f"ntc_move:{session_id}"
-                ),
-                InlineKeyboardButton(
-                    text="Отменить", callback_data=f"ntc_cancel:{session_id}"
-                ),
-            ]
-        ]
-    )
-    await query.message.answer(
-        f"{group_name}, {format_school_datetime(school_session.starts_at)}, "
-        f"{school_session.place}.\n"
-        f"Сообщение уйдёт {len(audience)} чел.",
-        reply_markup=kb,
-    )
+    await _send_notice_session_actions(query.message, session_id)
 
 
 @router.callback_query(F.data.startswith("ntc_move:"))
@@ -3833,7 +4038,10 @@ async def menu_notice(message: Message, state: FSMContext) -> None:
             state,
             purpose="msg",
             rows=pick_rows,
-            title="Или выберите из списка:",
+            title=(
+                "Номер или несколько номеров через запятую — кому написать. "
+                "Кнопка группы выше отправит сообщение всей группе."
+            ),
         )
 
 
@@ -3849,22 +4057,6 @@ async def cb_notice_group(query: CallbackQuery, state: FSMContext) -> None:
             return
     await state.set_state(NoticeFSM.text)
     await state.update_data(group_id=group_id, person_id=None)
-    await query.answer()
-    await query.message.answer("Текст сообщения:")
-
-
-@router.callback_query(F.data.startswith("ntc_person:"))
-async def cb_notice_person(query: CallbackQuery, state: FSMContext) -> None:
-    if query.data is None or query.from_user is None or query.message is None:
-        return
-    person_id = query.data.split(":", 1)[1]
-    async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, query.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await query.answer(REFUSAL, show_alert=True)
-            return
-    await state.set_state(NoticeFSM.text)
-    await state.update_data(person_id=person_id, group_id=None)
     await query.answer()
     await query.message.answer("Текст сообщения:")
 
@@ -4097,6 +4289,82 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         await state.clear()
         await message.answer("Список устарел.")
         return
+
+    if purpose in _LIST_PICK_INDEX_PURPOSES:
+        if purpose == "grp_roster":
+            text = message.text.strip()
+            if not text.isdigit():
+                async with async_session_maker() as session:
+                    group = await create_group(session, text)
+                    await session.commit()
+                    group_id = group.id
+                await state.set_state(RosterFSM.active)
+                await state.update_data(group_id=group_id, drafts=[])
+                await message.answer(
+                    f"Группа «{text}» создана.\n"
+                    "Пришлите строки состава (по одному человеку на строку) "
+                    "или фото списка."
+                )
+                return
+        try:
+            picked = resolve_picks(rows, message.text, many=False)
+        except PickError as exc:
+            await message.answer(exc.message)
+            return
+        if purpose == "grp":
+            await _send_group_card(message, picked[0].id)
+            return
+        if purpose == "prd":
+            await _send_product_card(message, picked[0].id)
+            return
+        if purpose == "today":
+            await _start_admin_attendance_pick(message, state, picked[0].id)
+            return
+        if purpose == "sess":
+            await _send_notice_session_actions(message, picked[0].id)
+            return
+        if purpose == "slot_week":
+            await state.update_data(mode="edit_all", slot_id=picked[0].id)
+            await message.answer(
+                "Новый день недели:",
+                reply_markup=_weekday_keyboard("wday"),
+            )
+            return
+        if purpose == "slot_once":
+            await state.update_data(mode="edit_one", slot_id=picked[0].id)
+            await state.set_state(WeekFSM.once_date)
+            await message.answer("Дата занятия (ДД-ММ-ГГГГ):")
+            return
+        if purpose == "grp_slot":
+            await state.update_data(mode="new", group_id=picked[0].id)
+            await message.answer(
+                "День недели:",
+                reply_markup=_weekday_keyboard("wday"),
+            )
+            return
+        if purpose == "grp_roster":
+            await _begin_roster_group(message, state, picked[0].id)
+            return
+        if purpose == "grp_stream":
+            group_id = picked[0].id
+            async with async_session_maker() as session:
+                group = await session.get(Group, group_id)
+                if group is None:
+                    await message.answer("Не найдено")
+                    return
+                kb = await _stream_pick_keyboard(
+                    session, mode="edit_group", group_id=group_id
+                )
+            await state.update_data(edit_group_id=group_id)
+            await message.answer(
+                f"Поток для группы «{group.name}»:", reply_markup=kb
+            )
+            return
+        if purpose == "grp_assign":
+            await _apply_assign_group_choice(message, state, picked[0].id)
+            return
+        return
+
     try:
         picked = resolve_picks(rows, message.text, many=True)
     except PickError as exc:
@@ -4504,7 +4772,7 @@ async def cb_new_group_stream(query: CallbackQuery, state: FSMContext) -> None:
 
 
 @router.callback_query(F.data == "admin_group_stream")
-async def cb_admin_group_stream(query: CallbackQuery) -> None:
+async def cb_admin_group_stream(query: CallbackQuery, state: FSMContext) -> None:
     admin = await _person_for_callback(query)
     if admin is None or not _is_admin(admin):
         await query.answer(REFUSAL, show_alert=True)
@@ -4514,19 +4782,17 @@ async def cb_admin_group_stream(query: CallbackQuery) -> None:
     if not groups:
         await query.answer("Сначала создайте группу", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text=g.name, callback_data=f"pick_grp_strm:{g.id}"
-                )
-            ]
-            for g in groups
-        ]
-    )
+    rows = [PickRow(id=g.id, full_name=g.name) for g in groups]
     await query.answer()
     if query.message:
-        await query.message.answer("Выберите группу для потока:", reply_markup=kb)
+        await _start_list_pick(
+            query.message,
+            state,
+            purpose="grp_stream",
+            rows=rows,
+            title="Номер выберет группу.",
+            hint=HINT_INDEX,
+        )
 
 
 @router.callback_query(F.data.startswith("pick_grp_strm:"))
@@ -4638,7 +4904,7 @@ async def fsm_edit_group_stream_name(message: Message, state: FSMContext) -> Non
     )
 
 
-async def _slot_button_rows(session: AsyncSession, prefix: str) -> list[list[InlineKeyboardButton]]:
+async def _weekly_slot_pick_rows(session: AsyncSession) -> list[PickRow]:
     rows = (
         await session.execute(
             select(WeeklySlot, Group)
@@ -4650,18 +4916,16 @@ async def _slot_button_rows(session: AsyncSession, prefix: str) -> list[list[Inl
             .order_by(Group.name, WeeklySlot.weekday, WeeklySlot.start_time)
         )
     ).all()
-    buttons = []
+    pick_rows: list[PickRow] = []
     for slot, group in rows:
-        label = (
-            f"{group.name} {WEEKDAY_LABELS[slot.weekday]} "
-            f"{slot.start_time.strftime('%H:%M')}"
+        detail = (
+            f"{WEEKDAY_LABELS[slot.weekday]} "
+            f"{slot.start_time.strftime('%H:%M')}, {slot.place}"
         )
         if slot.notes:
-            label = f"{label} ({slot.notes})"
-        buttons.append(
-            [InlineKeyboardButton(text=label[:60], callback_data=f"{prefix}:{slot.id}")]
-        )
-    return buttons
+            detail = f"{detail} ({slot.notes})"
+        pick_rows.append(PickRow(id=slot.id, full_name=group.name, detail=detail))
+    return pick_rows
 
 
 @router.callback_query(F.data.startswith("wday:"))
@@ -4683,16 +4947,21 @@ async def cb_admin_edit_week(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer(REFUSAL, show_alert=True)
         return
     async with async_session_maker() as session:
-        buttons = await _slot_button_rows(session, "wedit")
-    if not buttons:
+        pick_rows = await _weekly_slot_pick_rows(session)
+    if not pick_rows:
         await query.answer("Нет недельных слотов", show_alert=True)
         return
     await state.update_data(mode="edit_all")
     await query.answer()
     if query.message:
-        await query.message.answer(
-            "Какой слот изменить на все недели?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        await query.message.answer("Какой слот изменить на все недели?")
+        await _start_list_pick(
+            query.message,
+            state,
+            purpose="slot_week",
+            rows=pick_rows,
+            title="Номер откроет этот слот.",
+            hint=HINT_INDEX,
         )
 
 
@@ -4717,15 +4986,22 @@ async def cb_admin_edit_once(query: CallbackQuery, state: FSMContext) -> None:
         await query.answer(REFUSAL, show_alert=True)
         return
     async with async_session_maker() as session:
-        buttons = await _slot_button_rows(session, "wonce")
-    if not buttons:
+        pick_rows = await _weekly_slot_pick_rows(session)
+    if not pick_rows:
         await query.answer("Нет недельных слотов", show_alert=True)
         return
     await query.answer()
     if query.message:
         await query.message.answer(
-            "Какое повторяющееся занятие изменить на одну дату?",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+            "Какое повторяющееся занятие изменить на одну дату?"
+        )
+        await _start_list_pick(
+            query.message,
+            state,
+            purpose="slot_once",
+            rows=pick_rows,
+            title="Номер откроет этот слот.",
+            hint=HINT_INDEX,
         )
 
 
