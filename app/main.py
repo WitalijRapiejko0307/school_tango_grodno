@@ -90,6 +90,37 @@ async def lifespan(app: FastAPI):
                     "ALTER COLUMN valid_until DROP NOT NULL"
                 )
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE groups ADD COLUMN IF NOT EXISTS "
+                    "archived_at TIMESTAMPTZ"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE contact_cards ADD COLUMN IF NOT EXISTS "
+                    "archived_at TIMESTAMPTZ"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE attendances ADD COLUMN IF NOT EXISTS "
+                    "marked_by_id VARCHAR(36)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "DO $$ BEGIN "
+                    "IF NOT EXISTS ("
+                    "SELECT 1 FROM pg_constraint "
+                    "WHERE conname = 'fk_attendances_marked_by_id_persons'"
+                    ") THEN "
+                    "ALTER TABLE attendances ADD CONSTRAINT "
+                    "fk_attendances_marked_by_id_persons "
+                    "FOREIGN KEY (marked_by_id) REFERENCES persons(id); "
+                    "END IF; END $$"
+                )
+            )
             has_alembic = await conn.execute(
                 text(
                     "SELECT 1 FROM information_schema.tables "
@@ -106,8 +137,11 @@ async def lifespan(app: FastAPI):
         if has_alembic.first() is not None:
             await conn.execute(
                 text(
-                    "UPDATE alembic_version SET version_num = 'c8d9e0f1a2b3' "
-                    "WHERE version_num IN ('a1b2c3d4e5f6', 'b7c8d9e0f1a2')"
+                    "UPDATE alembic_version SET version_num = 'e0f1a2b3c4d5' "
+                    "WHERE version_num IN ("
+                    "'a1b2c3d4e5f6', 'b7c8d9e0f1a2', "
+                    "'c8d9e0f1a2b3', 'd9e0f1a2b3c4'"
+                    ")"
                 )
             )
 
