@@ -1,15 +1,20 @@
+from datetime import date, datetime, timezone
+
 import pytest
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db import Base
-from app.models import GroupMembership, Person
+from app.models import Attendance, GroupMembership, Person, SchoolSession
 from app.services.roster import (
     claim_person,
     confirm_roster,
+    end_group_membership,
     find_unclaimed_by_query,
     name_key_from_parts,
+    name_key_from_query,
     parse_roster_line,
+    update_person_card,
 )
 from app.services.schedule import create_group
 
@@ -139,6 +144,90 @@ async def test_confirm_idempotent_in_same_group(db_session: AsyncSession) -> Non
 
     count = await db_session.scalar(select(func.count()).select_from(Person))
     assert count == 1
+
+
+async def test_update_person_card_name_phone_name_key(db_session: AsyncSession) -> None:
+    person = Person(
+        full_name="Козловская Дарья",
+        name_key=name_key_from_parts("Козловская", "Дарья"),
+        role="admin",
+        phone=None,
+        telegram_user_id=1,
+    )
+    db_session.add(person)
+    await db_session.flush()
+
+    updated = await update_person_card(
+        db_session,
+        person.id,
+        "  Гулецкая Ирина Ивановна  ",
+        "+375291234567",
+    )
+    assert updated.full_name == "Гулецкая Ирина Ивановна"
+    assert updated.phone == "+375291234567"
+    assert updated.name_key == name_key_from_query("Гулецкая Ирина Ивановна")
+    assert updated.role == "admin"
+
+    with pytest.raises(ValueError, match="full_name"):
+        await update_person_card(db_session, person.id, "   ", None)
+
+
+async def test_end_group_membership_keeps_attendance(db_session: AsyncSession) -> None:
+    group = await create_group(db_session, "G")
+    person = Person(
+        full_name="Асадчий Владимир",
+        name_key=name_key_from_parts("Асадчий", "Владимир"),
+        role="client",
+    )
+    db_session.add(person)
+    await db_session.flush()
+    membership = GroupMembership(
+        group_id=group.id,
+        person_id=person.id,
+        started_on=date(2026, 1, 1),
+    )
+    db_session.add(membership)
+    school_session = SchoolSession(
+        group_id=group.id,
+        starts_at=datetime(2026, 5, 1, 18, 0, tzinfo=timezone.utc),
+        ends_at=datetime(2026, 5, 1, 19, 30, tzinfo=timezone.utc),
+        place="Hall",
+        status="scheduled",
+    )
+    db_session.add(school_session)
+    await db_session.flush()
+    db_session.add(
+        Attendance(
+            person_id=person.id,
+            session_id=school_session.id,
+            marked_by_id=person.id,
+            source="admin",
+            marked_at=datetime(2026, 5, 1, 20, 0, tzinfo=timezone.utc),
+        )
+    )
+    await db_session.flush()
+
+    ended = await end_group_membership(db_session, person.id, date(2026, 6, 1))
+    assert ended is not None
+    assert ended.id == membership.id
+    assert ended.ended_on == date(2026, 6, 1)
+
+    attendance_count = await db_session.scalar(
+        select(func.count()).select_from(Attendance)
+    )
+    assert attendance_count == 1
+
+
+async def test_end_group_membership_none_without_active(db_session: AsyncSession) -> None:
+    person = Person(
+        full_name="Solo Person",
+        name_key=None,
+        role="client",
+    )
+    db_session.add(person)
+    await db_session.flush()
+
+    assert await end_group_membership(db_session, person.id, date(2026, 6, 1)) is None
 
 
 async def test_claim_sets_telegram_id(db_session: AsyncSession) -> None:

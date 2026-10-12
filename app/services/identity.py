@@ -4,7 +4,7 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import AdminInvite, Person
+from app.models import AdminInvite, GroupMembership, Person
 
 
 def _normalize_username(username: str | None) -> str | None:
@@ -153,5 +153,36 @@ async def assign_client(session: AsyncSession, person_id: str) -> Person:
     person = result.scalar_one()
     if person.role != "admin":
         person.role = "client"
+    await session.flush()
+    return person
+
+
+async def demote_admin(
+    session: AsyncSession, actor_id: str, target_id: str
+) -> Person:
+    if actor_id == target_id:
+        raise ValueError("Cannot demote yourself")
+
+    result = await session.execute(select(Person).where(Person.id == target_id))
+    person = result.scalar_one()
+
+    if person.role != "admin":
+        raise ValueError("Person is not an admin")
+
+    admin_count = await session.scalar(
+        select(func.count()).select_from(Person).where(Person.role == "admin")
+    )
+    if admin_count <= 1:
+        raise ValueError("Cannot demote the last admin")
+
+    membership = await session.execute(
+        select(GroupMembership.id)
+        .where(
+            GroupMembership.person_id == target_id,
+            GroupMembership.ended_on.is_(None),
+        )
+        .limit(1)
+    )
+    person.role = "client" if membership.first() is not None else "guest"
     await session.flush()
     return person

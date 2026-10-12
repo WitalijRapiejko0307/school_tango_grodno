@@ -5,18 +5,24 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db import Base
-from app.models import Group, GroupMembership, Person, SchoolSession
+from app.models import Attendance, Group, GroupMembership, Person, SchoolSession, WeeklySlot
 from app.services.schedule import (
+    _tz,
+    archive_group,
     assign_group,
     create_group,
     create_session,
     create_stream,
     create_weekly_slot,
+    deactivate_weekly_slot,
+    ensure_occurrence,
     group_transfer_confirmation_text,
     list_month_sessions,
     materialize_range,
     override_occurrence,
     parse_dmy,
+    rename_group,
+    restore_group,
     set_group_stream,
     update_weekly_slot,
 )
@@ -176,3 +182,152 @@ async def test_override_one_date_is_kept_when_weekly_slot_changes(
     assert by_date[friday].overridden is True
     assert by_date[next_friday].place == "Новый зал"
     assert by_date[next_friday].overridden is False
+
+
+def _next_on_weekday(weekday: int) -> date:
+    today = datetime.now(_tz()).date()
+    return today + timedelta(days=(weekday - today.weekday()) % 7)
+
+
+async def _slot_with_future_sessions(
+    db_session: AsyncSession, weekday: int = 4
+) -> tuple[Group, WeeklySlot, date, date]:
+    group = await create_group(db_session, "Archive test")
+    slot = await create_weekly_slot(
+        db_session, group.id, weekday, time(19, 0), time(20, 0), "Зал", None
+    )
+    first = _next_on_weekday(weekday)
+    second = first + timedelta(days=7)
+    await materialize_range(db_session, first, second + timedelta(days=1))
+    return group, slot, first, second
+
+
+async def test_rename_group_strips_and_rejects_empty(
+    db_session: AsyncSession,
+) -> None:
+    group = await create_group(db_session, "Old")
+    updated = await rename_group(db_session, group.id, "  New name  ")
+    assert updated.name == "New name"
+    with pytest.raises(ValueError, match="name"):
+        await rename_group(db_session, group.id, "   ")
+
+
+async def test_archive_group_cancels_future_unmarked_sessions(
+    db_session: AsyncSession,
+) -> None:
+    group, slot, first, second = await _slot_with_future_sessions(db_session)
+    person = Person(full_name="Dancer", role="client", telegram_user_id=7001)
+    db_session.add(person)
+    await db_session.flush()
+
+    plain = (
+        await db_session.execute(
+            select(SchoolSession).where(
+                SchoolSession.weekly_slot_id == slot.id,
+                SchoolSession.session_date == first,
+            )
+        )
+    ).scalar_one()
+    with_attendance = (
+        await db_session.execute(
+            select(SchoolSession).where(
+                SchoolSession.weekly_slot_id == slot.id,
+                SchoolSession.session_date == second,
+            )
+        )
+    ).scalar_one()
+    db_session.add(
+        Attendance(
+            person_id=person.id,
+            session_id=with_attendance.id,
+            marked_by_id=person.id,
+            source="admin",
+            marked_at=datetime.now(timezone.utc),
+        )
+    )
+    await db_session.flush()
+
+    third = second + timedelta(days=7)
+    await ensure_occurrence(db_session, slot, third)
+    await override_occurrence(
+        db_session, slot.id, third, time(18, 0), time(19, 0), "Override hall", None
+    )
+
+    past = first - timedelta(days=14)
+    past_session = await ensure_occurrence(db_session, slot, past)
+    assert past_session.session_date == past
+
+    now = datetime.now(timezone.utc)
+    archived, summary = await archive_group(db_session, group.id, now)
+
+    assert archived.archived_at == now
+    assert summary.cancelled == 1
+    assert summary.kept == 2
+
+    await db_session.refresh(plain)
+    await db_session.refresh(with_attendance)
+    await db_session.refresh(past_session)
+    await db_session.refresh(slot)
+    assert plain.status == "cancelled"
+    assert with_attendance.status == "scheduled"
+    assert past_session.status == "scheduled"
+    assert slot.active is False
+
+
+async def test_restore_group_does_not_reactivate_slots(
+    db_session: AsyncSession,
+) -> None:
+    group, slot, _, _ = await _slot_with_future_sessions(db_session)
+    now = datetime.now(timezone.utc)
+    await archive_group(db_session, group.id, now)
+    restored = await restore_group(db_session, group.id)
+    assert restored.archived_at is None
+    await db_session.refresh(slot)
+    assert slot.active is False
+
+
+async def test_deactivate_weekly_slot_same_session_rules(
+    db_session: AsyncSession,
+) -> None:
+    group, slot, first, second = await _slot_with_future_sessions(db_session)
+    person = Person(full_name="P", role="client", telegram_user_id=7002)
+    db_session.add(person)
+    await db_session.flush()
+
+    to_cancel = (
+        await db_session.execute(
+            select(SchoolSession).where(
+                SchoolSession.weekly_slot_id == slot.id,
+                SchoolSession.session_date == first,
+            )
+        )
+    ).scalar_one()
+    kept = (
+        await db_session.execute(
+            select(SchoolSession).where(
+                SchoolSession.weekly_slot_id == slot.id,
+                SchoolSession.session_date == second,
+            )
+        )
+    ).scalar_one()
+    db_session.add(
+        Attendance(
+            person_id=person.id,
+            session_id=kept.id,
+            marked_by_id=person.id,
+            source="admin",
+            marked_at=datetime.now(timezone.utc),
+        )
+    )
+    await db_session.flush()
+
+    updated, cancelled, kept_count = await deactivate_weekly_slot(db_session, slot.id)
+    assert updated.active is False
+    assert cancelled == 1
+    assert kept_count == 1
+
+    await db_session.refresh(to_cancel)
+    await db_session.refresh(kept)
+    assert to_cancel.status == "cancelled"
+    assert kept.status == "scheduled"
+    assert group.id == updated.group_id

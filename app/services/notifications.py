@@ -773,11 +773,11 @@ def second_booking_prompt_text(group_name: str, starts_at: datetime) -> str:
     )
 
 
-async def list_today_session_reminder_lines(
+async def list_today_session_reminder_summary(
     session: AsyncSession,
     day: date,
-) -> list[str]:
-    """Admin-facing lines for session reminder reactions on ``day`` (school calendar)."""
+) -> list[tuple[Reminder, Person, str]]:
+    """Reminder rows for admin pick lists on ``day`` (school calendar)."""
     tz = _school_tz()
     day_start = datetime(day.year, day.month, day.day, tzinfo=tz)
     day_end = day_start + timedelta(days=1)
@@ -794,14 +794,22 @@ async def list_today_session_reminder_lines(
         )
         .order_by(SchoolSession.starts_at, Person.full_name)
     )
-    lines: list[str] = []
+    rows: list[tuple[Reminder, Person, str]] = []
     for reminder, person, school_session, group in result.all():
         status = _reminder_status_ru(reminder.response)
         when = format_school_datetime(school_session.starts_at)
-        lines.append(
-            f"{person.full_name} — {status}, группа «{group.name}», {when}"
-        )
-    return lines
+        detail = f"{status}, группа «{group.name}», {when}"
+        rows.append((reminder, person, detail))
+    return rows
+
+
+async def list_today_session_reminder_lines(
+    session: AsyncSession,
+    day: date,
+) -> list[str]:
+    """Admin-facing lines for session reminder reactions on ``day`` (school calendar)."""
+    summary = await list_today_session_reminder_summary(session, day)
+    return [f"{person.full_name} — {detail}" for _rem, person, detail in summary]
 
 
 def _reminder_status_ru(response: str) -> str:

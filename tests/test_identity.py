@@ -1,11 +1,14 @@
+from datetime import date
+
 import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.config import Settings
 from app.db import Base
-from app.models import AdminInvite, Person
-from app.services.identity import assign_client, invite_admin, upsert_from_telegram
+from app.models import AdminInvite, GroupMembership, Person
+from app.services.identity import assign_client, demote_admin, invite_admin, upsert_from_telegram
+from app.services.schedule import create_group
 
 
 @pytest.fixture
@@ -116,3 +119,58 @@ async def test_assign_client_sets_role_but_preserves_admin(
 
     updated_admin = await assign_client(db_session, admin.id)
     assert updated_admin.role == "admin"
+
+
+async def test_demote_admin_to_client_when_active_group_member(
+    db_session: AsyncSession,
+) -> None:
+    actor = Person(full_name="Actor", role="admin", telegram_user_id=5001)
+    target = Person(full_name="Target", role="admin", telegram_user_id=5002)
+    db_session.add_all([actor, target])
+    await db_session.flush()
+
+    group = await create_group(db_session, "Beginners")
+    db_session.add(
+        GroupMembership(
+            group_id=group.id,
+            person_id=target.id,
+            started_on=date(2026, 1, 1),
+            ended_on=None,
+        )
+    )
+    await db_session.flush()
+
+    demoted = await demote_admin(db_session, actor.id, target.id)
+    assert demoted.id == target.id
+    assert demoted.role == "client"
+
+
+async def test_demote_admin_to_guest_without_active_membership(
+    db_session: AsyncSession,
+) -> None:
+    actor = Person(full_name="Actor", role="admin", telegram_user_id=6001)
+    target = Person(full_name="Target", role="admin", telegram_user_id=6002)
+    db_session.add_all([actor, target])
+    await db_session.flush()
+
+    demoted = await demote_admin(db_session, actor.id, target.id)
+    assert demoted.role == "guest"
+
+
+async def test_demote_admin_rejects_self(db_session: AsyncSession) -> None:
+    admin = Person(full_name="Solo", role="admin", telegram_user_id=7001)
+    db_session.add(admin)
+    await db_session.flush()
+
+    with pytest.raises(ValueError, match="yourself"):
+        await demote_admin(db_session, admin.id, admin.id)
+
+
+async def test_demote_admin_rejects_last_admin(db_session: AsyncSession) -> None:
+    only_admin = Person(full_name="Only", role="admin", telegram_user_id=8001)
+    client = Person(full_name="Client", role="client", telegram_user_id=8002)
+    db_session.add_all([only_admin, client])
+    await db_session.flush()
+
+    with pytest.raises(ValueError, match="last admin"):
+        await demote_admin(db_session, client.id, only_admin.id)

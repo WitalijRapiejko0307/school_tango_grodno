@@ -1,6 +1,7 @@
 """Schedule application services (groups, streams, weekly slots, sessions)."""
 
-from datetime import date, datetime, time, timedelta
+from dataclasses import dataclass
+from datetime import date, datetime, time, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from sqlalchemy import and_, select
@@ -8,6 +9,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
 from app.models import (
+    Attendance,
     Group,
     GroupMembership,
     Person,
@@ -369,3 +371,176 @@ async def list_month_sessions(
         ).order_by(SchoolSession.starts_at)
     )
     return list(result.scalars().all())
+
+
+@dataclass
+class ArchiveSessionsSummary:
+    cancelled: int
+    kept: int
+
+
+async def _sessions_for_slots_query(
+    session: AsyncSession, slot_ids: list[str], from_date: date
+):
+    return await session.execute(
+        select(SchoolSession).where(
+            SchoolSession.weekly_slot_id.in_(slot_ids),
+            SchoolSession.session_date.is_not(None),
+            SchoolSession.session_date >= from_date,
+            SchoolSession.status == "scheduled",
+        )
+    )
+
+
+async def _cancel_future_unmarked_sessions(
+    session: AsyncSession, slot_ids: list[str]
+) -> ArchiveSessionsSummary:
+    if not slot_ids:
+        return ArchiveSessionsSummary(cancelled=0, kept=0)
+    today = datetime.now(_tz()).date()
+    result = await _sessions_for_slots_query(session, slot_ids, today)
+    cancelled = 0
+    kept = 0
+    for school_session in result.scalars().all():
+        if school_session.overridden:
+            kept += 1
+            continue
+        att = await session.execute(
+            select(Attendance.id).where(
+                Attendance.session_id == school_session.id
+            )
+        )
+        if att.first() is not None:
+            kept += 1
+            continue
+        school_session.status = "cancelled"
+        cancelled += 1
+    await session.flush()
+    return ArchiveSessionsSummary(cancelled=cancelled, kept=kept)
+
+
+async def count_archive_impact(
+    session: AsyncSession, group_id: str
+) -> ArchiveSessionsSummary:
+    """Future scheduled sessions that would stay (attendance or overridden)."""
+    slots = list(
+        (
+            await session.execute(
+                select(WeeklySlot.id).where(WeeklySlot.group_id == group_id)
+            )
+        ).scalars().all()
+    )
+    if not slots:
+        return ArchiveSessionsSummary(cancelled=0, kept=0)
+    today = datetime.now(_tz()).date()
+    result = await _sessions_for_slots_query(session, slots, today)
+    cancelled = 0
+    kept = 0
+    for school_session in result.scalars().all():
+        if school_session.overridden:
+            kept += 1
+            continue
+        att = await session.execute(
+            select(Attendance.id).where(
+                Attendance.session_id == school_session.id
+            )
+        )
+        if att.first() is not None:
+            kept += 1
+        else:
+            cancelled += 1
+    return ArchiveSessionsSummary(cancelled=cancelled, kept=kept)
+
+
+async def rename_group(
+    session: AsyncSession, group_id: str, name: str
+) -> Group:
+    group = await session.get(Group, group_id)
+    if group is None:
+        raise ValueError("group")
+    cleaned = name.strip()
+    if not cleaned:
+        raise ValueError("name")
+    group.name = cleaned
+    await session.flush()
+    return group
+
+
+async def archive_group(
+    session: AsyncSession, group_id: str, now: datetime
+) -> tuple[Group, ArchiveSessionsSummary]:
+    group = await session.get(Group, group_id)
+    if group is None:
+        raise ValueError("group")
+    if group.archived_at is None:
+        group.archived_at = now
+    slots = list(
+        (
+            await session.execute(
+                select(WeeklySlot).where(WeeklySlot.group_id == group_id)
+            )
+        ).scalars().all()
+    )
+    slot_ids = [s.id for s in slots]
+    for slot in slots:
+        slot.active = False
+    summary = await _cancel_future_unmarked_sessions(session, slot_ids)
+    await session.flush()
+    return group, summary
+
+
+async def restore_group(session: AsyncSession, group_id: str) -> Group:
+    group = await session.get(Group, group_id)
+    if group is None:
+        raise ValueError("group")
+    group.archived_at = None
+    await session.flush()
+    return group
+
+
+async def deactivate_weekly_slot(
+    session: AsyncSession, slot_id: str
+) -> tuple[WeeklySlot, int, int]:
+    slot = await session.get(WeeklySlot, slot_id)
+    if slot is None:
+        raise ValueError("slot")
+    slot.active = False
+    summary = await _cancel_future_unmarked_sessions(session, [slot.id])
+    await session.flush()
+    return slot, summary.cancelled, summary.kept
+
+
+async def restore_weekly_slot(session: AsyncSession, slot_id: str) -> WeeklySlot:
+    slot = await session.get(WeeklySlot, slot_id)
+    if slot is None:
+        raise ValueError("slot")
+    slot.active = True
+    await session.flush()
+    return slot
+
+
+async def count_slot_deactivate_impact(
+    session: AsyncSession, slot_id: str
+) -> ArchiveSessionsSummary:
+    """Future scheduled sessions that would stay (attendance or overridden)."""
+    slot = await session.get(WeeklySlot, slot_id)
+    if slot is None:
+        raise ValueError("slot")
+    today = datetime.now(_tz()).date()
+    result = await _sessions_for_slots_query(session, [slot.id], today)
+    cancelled = 0
+    kept = 0
+    for school_session in result.scalars().all():
+        if school_session.overridden:
+            kept += 1
+            continue
+        att = await session.execute(
+            select(Attendance.id).where(
+                Attendance.session_id == school_session.id
+            )
+        )
+        if att.first() is not None:
+            kept += 1
+        else:
+            cancelled += 1
+    return ArchiveSessionsSummary(cancelled=cancelled, kept=kept)

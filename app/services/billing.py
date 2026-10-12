@@ -109,6 +109,57 @@ async def active_subscription(
     return result.scalar_one_or_none()
 
 
+async def _get_product(session: AsyncSession, product_id: str) -> Product:
+    result = await session.execute(
+        select(Product).where(Product.id == product_id)
+    )
+    return result.scalar_one()
+
+
+async def update_product(
+    session: AsyncSession,
+    product_id: str,
+    name: str,
+    lessons_count: int | None = None,
+    validity_days: int | None = None,
+) -> Product:
+    product = await _get_product(session, product_id)
+    stripped = name.strip()
+    if not stripped:
+        raise ValueError("name must not be empty")
+    product.name = stripped
+    if product.kind == "subscription":
+        if lessons_count is None or validity_days is None:
+            raise ValueError(
+                "subscription requires lessons_count and validity_days"
+            )
+        if lessons_count <= 0 or validity_days <= 0:
+            raise ValueError(
+                "subscription requires positive lessons_count and validity_days"
+            )
+        product.lessons_count = lessons_count
+        product.validity_days = validity_days
+    elif product.kind == "drop_in":
+        product.lessons_count = None
+        product.validity_days = None
+    await session.flush()
+    return product
+
+
+async def deactivate_product(session: AsyncSession, product_id: str) -> Product:
+    product = await _get_product(session, product_id)
+    product.active = False
+    await session.flush()
+    return product
+
+
+async def restore_product(session: AsyncSession, product_id: str) -> Product:
+    product = await _get_product(session, product_id)
+    product.active = True
+    await session.flush()
+    return product
+
+
 async def list_active_products_with_prices(
     session: AsyncSession, on_date: date
 ) -> list[tuple[Product, Price]]:

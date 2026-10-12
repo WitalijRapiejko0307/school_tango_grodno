@@ -251,6 +251,36 @@ async def confirm_roster(
     return ConfirmRosterResult(created=created, skipped=skipped)
 
 
+async def update_person_card(
+    session: AsyncSession,
+    person_id: str,
+    full_name: str,
+    phone: str | None,
+) -> Person:
+    person = await session.get(Person, person_id)
+    if person is None:
+        raise ValueError("person")
+    stripped = full_name.strip()
+    if not stripped:
+        raise ValueError("full_name")
+    person.full_name = stripped
+    person.phone = phone
+    person.name_key = name_key_from_query(stripped)
+    await session.flush()
+    return person
+
+
+async def end_group_membership(
+    session: AsyncSession, person_id: str, ended_on: date
+) -> GroupMembership | None:
+    membership = await _any_active_membership(session, person_id)
+    if membership is None:
+        return None
+    membership.ended_on = ended_on
+    await session.flush()
+    return membership
+
+
 async def claim_person(
     session: AsyncSession,
     person_id: str,
