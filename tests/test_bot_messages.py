@@ -8,6 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.db import Base
 from app.models import BotChatMessage, Person
+from aiogram.exceptions import TelegramBadRequest
+from aiogram.methods import DeleteMessage
+
 from app.services.bot_messages import (
     ADMIN_CHAT_LIMIT,
     CLIENT_GUEST_CHAT_LIMIT,
@@ -203,6 +206,45 @@ async def test_delete_failure_does_not_remove_row(db_session: AsyncSession) -> N
     )
 
     assert await db_session.get(BotChatMessage, row.id) is not None
+
+
+async def test_missing_telegram_message_drops_row(db_session: AsyncSession) -> None:
+    person = await _client(db_session)
+    bot = AsyncMock()
+    bot.delete_message.side_effect = TelegramBadRequest(
+        method=DeleteMessage(chat_id=1, message_id=1),
+        message="message to delete not found",
+    )
+    chat_id = person.telegram_user_id or 0
+    base = datetime(2026, 10, 2, 9, 0, tzinfo=UTC)
+    oldest = BotChatMessage(
+        person_id=person.id,
+        chat_id=chat_id,
+        telegram_message_id=42,
+        school_session_id=None,
+        is_reply_menu_anchor=False,
+        sent_at=base,
+    )
+    db_session.add(oldest)
+    for i in range(CLIENT_GUEST_CHAT_LIMIT):
+        db_session.add(
+            BotChatMessage(
+                person_id=person.id,
+                chat_id=chat_id,
+                telegram_message_id=50 + i,
+                school_session_id=None,
+                is_reply_menu_anchor=False,
+                sent_at=base + timedelta(seconds=i + 1),
+            )
+        )
+    await db_session.flush()
+
+    await apply_message_deletions(
+        db_session, bot, person, today=date(2026, 10, 2)
+    )
+    await db_session.flush()
+
+    assert await db_session.get(BotChatMessage, oldest.id) is None
 
 
 async def test_record_clears_previous_menu_anchor(db_session: AsyncSession) -> None:

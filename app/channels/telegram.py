@@ -143,21 +143,25 @@ router = Router(name="telegram")
 
 class _TrackUserMessageMiddleware(BaseMiddleware):
     async def __call__(self, handler, event, data):
-        if (
-            isinstance(event, Message)
-            and event.from_user is not None
-            and not event.from_user.is_bot
-            and event.bot is not None
-        ):
-            try:
-                await track_user_message(event.bot, event.chat.id, event.message_id)
-            except Exception:
-                logger.exception(
-                    "Failed to track user message %s in chat %s",
-                    event.message_id,
-                    event.chat.id,
-                )
-        return await handler(event, data)
+        try:
+            return await handler(event, data)
+        finally:
+            if (
+                isinstance(event, Message)
+                and event.from_user is not None
+                and not event.from_user.is_bot
+                and event.bot is not None
+            ):
+                try:
+                    await track_user_message(
+                        event.bot, event.chat.id, event.message_id
+                    )
+                except Exception:
+                    logger.exception(
+                        "Failed to track user message %s in chat %s",
+                        event.message_id,
+                        event.chat.id,
+                    )
 
 
 router.message.middleware(_TrackUserMessageMiddleware())

@@ -11,6 +11,7 @@ from contextvars import ContextVar
 from datetime import date, datetime
 
 from aiogram import Bot
+from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import ReplyKeyboardMarkup
 from sqlalchemy import select, update
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -27,6 +28,7 @@ _outbound_school_session_id: ContextVar[str | None] = ContextVar(
 
 ADMIN_CHAT_LIMIT = 20
 CLIENT_GUEST_CHAT_LIMIT = 10
+_MAX_DELETES_PER_PASS = 30
 
 
 def outbound_school_session_id() -> str | None:
@@ -60,17 +62,28 @@ def _session_local_date(session_row: SchoolSession) -> date:
 
 async def _try_delete_message(
     session: AsyncSession, bot: Bot, row: BotChatMessage
-) -> None:
+) -> bool:
+    """Delete one Telegram message. True when the row should not be retried."""
     try:
         await bot.delete_message(row.chat_id, row.telegram_message_id)
+    except TelegramBadRequest as exc:
+        logger.warning(
+            "Dropping chat message %s in chat %s: %s",
+            row.telegram_message_id,
+            row.chat_id,
+            exc,
+        )
+        await session.delete(row)
+        return True
     except Exception:
-        logger.exception(
-            "Failed to delete bot message %s in chat %s",
+        logger.warning(
+            "Failed to delete chat message %s in chat %s",
             row.telegram_message_id,
             row.chat_id,
         )
-        return
+        return False
     await session.delete(row)
+    return True
 
 
 async def apply_message_deletions(
@@ -100,7 +113,10 @@ async def apply_message_deletions(
         )
         sessions_by_id = {s.id: s for s in sess_result.scalars()}
 
+    deleted = 0
     for row in list(rows):
+        if deleted >= _MAX_DELETES_PER_PASS:
+            break
         sid = row.school_session_id
         if not sid:
             continue
@@ -109,6 +125,7 @@ async def apply_message_deletions(
             continue
         if _session_local_date(school_session) < today:
             await _try_delete_message(session, bot, row)
+            deleted += 1
 
     result = await session.execute(
         select(BotChatMessage)
@@ -118,9 +135,10 @@ async def apply_message_deletions(
     rows = list(result.scalars().all())
     limit = _chat_limit(person.role)
     non_anchor = [r for r in rows if not r.is_reply_menu_anchor]
-    while len(non_anchor) > limit:
+    while len(non_anchor) > limit and deleted < _MAX_DELETES_PER_PASS:
         oldest = non_anchor.pop(0)
         await _try_delete_message(session, bot, oldest)
+        deleted += 1
 
 
 async def record_bot_message(
