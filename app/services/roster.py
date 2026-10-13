@@ -2,7 +2,7 @@
 
 import re
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, datetime
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -221,6 +221,7 @@ async def confirm_roster(
             select(Person).where(
                 Person.name_key == item.name_key,
                 Person.telegram_user_id.is_(None),
+                Person.archived_at.is_(None),
             )
         )
         person = result.scalar_one_or_none()
@@ -266,6 +267,33 @@ async def update_person_card(
     person.full_name = stripped
     person.phone = phone
     person.name_key = name_key_from_query(stripped)
+    await session.flush()
+    return person
+
+
+async def archive_person(
+    session: AsyncSession,
+    person_id: str,
+    now: datetime,
+    ended_on: date,
+) -> Person:
+    person = await session.get(Person, person_id)
+    if person is None:
+        raise ValueError("person")
+    if person.archived_at is None:
+        person.archived_at = now
+    membership = await _any_active_membership(session, person_id)
+    if membership is not None:
+        membership.ended_on = ended_on
+    await session.flush()
+    return person
+
+
+async def restore_person(session: AsyncSession, person_id: str) -> Person:
+    person = await session.get(Person, person_id)
+    if person is None:
+        raise ValueError("person")
+    person.archived_at = None
     await session.flush()
     return person
 

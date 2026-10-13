@@ -104,6 +104,12 @@ async def lifespan(app: FastAPI):
             )
             await conn.execute(
                 text(
+                    "ALTER TABLE persons ADD COLUMN IF NOT EXISTS "
+                    "archived_at TIMESTAMPTZ"
+                )
+            )
+            await conn.execute(
+                text(
                     "ALTER TABLE attendances ADD COLUMN IF NOT EXISTS "
                     "marked_by_id VARCHAR(36)"
                 )
