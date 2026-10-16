@@ -599,12 +599,7 @@ async def _list_pick_rows_from_data(
                 rows.append(PickRow(id=group.id, full_name=group.name))
         return rows
     if purpose == "prd":
-        rows = []
-        for product_id in pick_ids:
-            product = await session.get(Product, product_id)
-            if product is not None and product.active:
-                rows.append(PickRow(id=product.id, full_name=product.name))
-        return rows
+        return await _product_pick_rows(session, pick_ids)
     if purpose in ("today", "sess"):
         rows = []
         for school_session_id in pick_ids:
@@ -4141,67 +4136,87 @@ async def menu_people(message: Message) -> None:
     await message.answer("Люди — выберите действие:", reply_markup=kb)
 
 
+async def _product_pick_rows(
+    session: AsyncSession, product_ids: list[str] | None = None
+) -> list[PickRow]:
+    today = _today_local()
+    if product_ids is None:
+        products = list(
+            (
+                await session.execute(
+                    select(Product)
+                    .where(Product.active.is_(True))
+                    .order_by(Product.name)
+                )
+            ).scalars().all()
+        )
+    else:
+        products = []
+        for product_id in product_ids:
+            product = await session.get(Product, product_id)
+            if product is not None and product.active:
+                products.append(product)
+    rows: list[PickRow] = []
+    for product in products:
+        price = await current_price(session, product.id, today)
+        detail = str(price.amount) if price is not None else "нет цены"
+        rows.append(PickRow(id=product.id, full_name=product.name, detail=detail))
+    return rows
+
+
 @router.message(F.text == BTN_PRICE)
 async def menu_price(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
         person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
         if person is None:
             return
-        today = _today_local()
-        items = await list_active_products_with_prices(session, today)
-        lines = ["Прайс:"]
-        for product, price in items:
-            kind = "абонемент" if product.kind == "subscription" else "разовое"
-            extra = ""
-            if product.lessons_count:
-                extra = f", {product.lessons_count} зан., {product.validity_days} дн."
-            lines.append(f"• {product.name} ({kind}{extra}): {price.amount}")
-        text = "\n".join(lines) if items else "Прайс пока пуст."
-        if _is_admin(person):
-            active_products = list(
-                (
-                    await session.execute(
-                        select(Product)
-                        .where(Product.active.is_(True))
-                        .order_by(Product.name)
-                    )
-                ).scalars().all()
-            )
-            kb_rows: list[list[InlineKeyboardButton]] = [
-                [InlineKeyboardButton(text="Абонемент", callback_data="price_sub")],
-                [InlineKeyboardButton(text="Разовое", callback_data="price_dropin")],
-                [
-                    InlineKeyboardButton(
-                        text="Выдать абонемент", callback_data="price_open_sub"
-                    )
-                ],
-                [
-                    InlineKeyboardButton(
-                        text="Новая цена", callback_data="price_new_price"
-                    )
-                ],
-            ]
-            kb_rows.append(
-                [
-                    InlineKeyboardButton(
-                        text="Архив продуктов", callback_data="prd_arch"
-                    )
-                ]
-            )
-            kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
-            await message.answer(text, reply_markup=kb)
-            if active_products:
-                prd_rows = [PickRow(id=p.id, full_name=p.name) for p in active_products]
-                await _start_list_pick(
-                    message,
-                    state,
-                    purpose="prd",
-                    rows=prd_rows,
-                    title="Номер откроет карточку продукта.",
-                    hint=HINT_INDEX,
+        if not _is_admin(person):
+            today = _today_local()
+            items = await list_active_products_with_prices(session, today)
+            lines = ["Прайс:"]
+            for product, price in items:
+                kind = "абонемент" if product.kind == "subscription" else "разовое"
+                extra = ""
+                if product.lessons_count:
+                    extra = f", {product.lessons_count} зан., {product.validity_days} дн."
+                lines.append(f"• {product.name} ({kind}{extra}): {price.amount}")
+            await message.answer("\n".join(lines) if items else "Прайс пока пуст.")
+            return
+        prd_rows = await _product_pick_rows(session)
+        kb_rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(text="Абонемент", callback_data="price_sub")],
+            [InlineKeyboardButton(text="Разовое", callback_data="price_dropin")],
+            [
+                InlineKeyboardButton(
+                    text="Выдать абонемент", callback_data="price_open_sub"
                 )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Новая цена", callback_data="price_new_price"
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Архив продуктов", callback_data="prd_arch"
+                )
+            ],
+        ]
+        if prd_rows:
+            await state.set_state(ListPickFSM.waiting)
+            await state.update_data(
+                pick_ids=[row.id for row in prd_rows],
+                pick_page=0,
+                pick_purpose="prd",
+            )
+            body = page_text(prd_rows, 0, HINT_INDEX)
+            text = f"Номер откроет карточку продукта.\n\n{body}"
+            more = _list_pick_keyboard(prd_rows, 0, "prd")
+            if more is not None:
+                kb_rows.extend(more.inline_keyboard)
         else:
-            await message.answer(text)
+            text = "Прайс пока пуст."
+        await message.answer(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=kb_rows))
 
 
 @router.message(F.text == BTN_REMINDERS)
