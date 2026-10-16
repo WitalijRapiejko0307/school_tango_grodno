@@ -127,6 +127,38 @@ async def lifespan(app: FastAPI):
                     "END IF; END $$"
                 )
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE products ADD COLUMN IF NOT EXISTS "
+                    "audience VARCHAR(16) NOT NULL DEFAULT 'person'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "UPDATE products SET audience = 'couple' "
+                    "WHERE name ILIKE '%семейная пара%' "
+                    "AND audience = 'person'"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS "
+                    "partner_id VARCHAR(36)"
+                )
+            )
+            await conn.execute(
+                text(
+                    "DO $$ BEGIN "
+                    "IF NOT EXISTS ("
+                    "SELECT 1 FROM pg_constraint "
+                    "WHERE conname = 'fk_subscriptions_partner_id_persons'"
+                    ") THEN "
+                    "ALTER TABLE subscriptions ADD CONSTRAINT "
+                    "fk_subscriptions_partner_id_persons "
+                    "FOREIGN KEY (partner_id) REFERENCES persons(id); "
+                    "END IF; END $$"
+                )
+            )
             has_alembic = await conn.execute(
                 text(
                     "SELECT 1 FROM information_schema.tables "
