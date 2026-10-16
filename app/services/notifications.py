@@ -353,39 +353,44 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
     subs_result = await session.execute(
         select(Subscription).where(Subscription.lessons_left == 1)
     )
+    subscription_low_text = "По абонементу осталось одно занятие."
     for sub in subs_result.scalars().all():
-        existing = await _find_reminder(
-            session,
-            sub.person_id,
-            "subscription_low",
-            subscription_id=sub.id,
-        )
-        if existing is not None:
-            if existing.sent_at is None:
-                person, _ = await _person_telegram(session, sub.person_id)
-                due.append(
-                    _due_from_reminder(
-                        existing,
-                        person,
-                        "По абонементу осталось одно занятие.",
-                    )
-                )
-            continue
-        reminder = Reminder(
-            person_id=sub.person_id,
-            kind="subscription_low",
-            subscription_id=sub.id,
-        )
-        session.add(reminder)
-        await session.flush()
-        person, _ = await _person_telegram(session, sub.person_id)
-        due.append(
-            _due_from_reminder(
-                reminder,
-                person,
-                "По абонементу осталось одно занятие.",
+        holder_ids = [sub.person_id]
+        if sub.partner_id is not None:
+            holder_ids.append(sub.partner_id)
+        for holder_id in holder_ids:
+            existing = await _find_reminder(
+                session,
+                holder_id,
+                "subscription_low",
+                subscription_id=sub.id,
             )
-        )
+            if existing is not None:
+                if existing.sent_at is None:
+                    person, _ = await _person_telegram(session, holder_id)
+                    due.append(
+                        _due_from_reminder(
+                            existing,
+                            person,
+                            subscription_low_text,
+                        )
+                    )
+                continue
+            reminder = Reminder(
+                person_id=holder_id,
+                kind="subscription_low",
+                subscription_id=sub.id,
+            )
+            session.add(reminder)
+            await session.flush()
+            person, _ = await _person_telegram(session, holder_id)
+            due.append(
+                _due_from_reminder(
+                    reminder,
+                    person,
+                    subscription_low_text,
+                )
+            )
 
     local_now = _to_local(now)
     if local_now.day == 1 and local_now.hour >= GUEST_MORNING_HOUR:

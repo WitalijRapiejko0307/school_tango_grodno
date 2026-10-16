@@ -191,6 +191,7 @@ class Product(Base):
     lessons_count: Mapped[int | None] = mapped_column(Integer, nullable=True)
     validity_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    audience: Mapped[str] = mapped_column(String(16), nullable=False, default="person")
 
 
 class Price(Base):
@@ -210,6 +211,9 @@ class Subscription(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("persons.id"), nullable=False
+    )
+    partner_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("persons.id"), nullable=True
     )
     product_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("products.id"), nullable=False

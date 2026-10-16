@@ -8,6 +8,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.db import Base
 from app.models import Person, Price, Subscription
 from app.services.billing import (
+    active_subscription,
     create_product,
     current_price,
     deactivate_product,
@@ -167,3 +168,171 @@ async def test_deactivate_and_restore_product_active_listing(
     items = await list_active_products_with_prices(db_session, on_date)
     assert len(items) == 1
     assert items[0][0].id == product.id
+
+
+async def test_create_product_couple_subscription_stores_audience(
+    db_session: AsyncSession,
+) -> None:
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple pack",
+        lessons_count=10,
+        validity_days=90,
+        audience="couple",
+    )
+    assert product.audience == "couple"
+
+
+async def test_open_couple_subscription_without_partner_raises(
+    db_session: AsyncSession,
+) -> None:
+    person = Person(full_name="Primary", role="client")
+    db_session.add(person)
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple",
+        lessons_count=8,
+        validity_days=60,
+        audience="couple",
+    )
+    with pytest.raises(ValueError, match="partner_id"):
+        await open_subscription(
+            db_session, person.id, product.id, started_on=date(2026, 1, 1)
+        )
+
+
+async def test_open_person_subscription_with_partner_raises(
+    db_session: AsyncSession,
+) -> None:
+    primary = Person(full_name="Primary", role="client")
+    partner = Person(full_name="Partner", role="client")
+    db_session.add_all([primary, partner])
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Solo",
+        lessons_count=8,
+        validity_days=60,
+    )
+    with pytest.raises(ValueError, match="must not have a partner"):
+        await open_subscription(
+            db_session,
+            primary.id,
+            product.id,
+            started_on=date(2026, 1, 1),
+            partner_id=partner.id,
+        )
+
+
+async def test_open_couple_subscription_success(
+    db_session: AsyncSession,
+) -> None:
+    primary = Person(full_name="Primary", role="client")
+    partner = Person(full_name="Partner", role="client")
+    db_session.add_all([primary, partner])
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple pack",
+        lessons_count=12,
+        validity_days=90,
+        audience="couple",
+    )
+    sub = await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=date(2026, 3, 1),
+        partner_id=partner.id,
+    )
+    assert sub.person_id == primary.id
+    assert sub.partner_id == partner.id
+    assert sub.lessons_left == 12
+    assert sub.valid_until is None
+
+
+async def test_active_subscription_finds_couple_for_partner(
+    db_session: AsyncSession,
+) -> None:
+    primary = Person(full_name="Primary", role="client")
+    partner = Person(full_name="Partner", role="client")
+    db_session.add_all([primary, partner])
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple",
+        lessons_count=6,
+        validity_days=30,
+        audience="couple",
+    )
+    sub = await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=date(2026, 4, 1),
+        partner_id=partner.id,
+    )
+
+    found = await active_subscription(db_session, partner.id, date(2026, 4, 15))
+    assert found is not None
+    assert found.id == sub.id
+
+
+@pytest.mark.parametrize("second_holder", ["primary", "partner"])
+async def test_second_active_couple_subscription_raises(
+    db_session: AsyncSession,
+    second_holder: str,
+) -> None:
+    primary = Person(full_name="Primary", role="client")
+    partner = Person(full_name="Partner", role="client")
+    other = Person(full_name="Other", role="client")
+    db_session.add_all([primary, partner, other])
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple A",
+        lessons_count=8,
+        validity_days=60,
+        audience="couple",
+    )
+    await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=date(2026, 5, 1),
+        partner_id=partner.id,
+    )
+
+    product_b = await create_product(
+        db_session,
+        "subscription",
+        "Couple B",
+        lessons_count=4,
+        validity_days=30,
+        audience="couple",
+    )
+    if second_holder == "primary":
+        new_primary, new_partner = primary.id, other.id
+    else:
+        new_primary, new_partner = other.id, partner.id
+
+    with pytest.raises(ValueError, match="active couple subscription"):
+        await open_subscription(
+            db_session,
+            new_primary,
+            product_b.id,
+            started_on=date(2026, 5, 2),
+            partner_id=new_partner,
+        )

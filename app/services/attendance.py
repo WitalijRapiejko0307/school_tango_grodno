@@ -88,15 +88,30 @@ async def mark_attendance(
 
     sub = await active_subscription(session, person_id, on_date)
     if sub is not None:
-        if sub.valid_until is None:
-            from app.models import Product
+        skip_debit = False
+        if sub.partner_id is not None:
+            other_person_id = (
+                sub.person_id if person_id == sub.partner_id else sub.partner_id
+            )
+            other_attendance = await session.execute(
+                select(Attendance).where(
+                    Attendance.person_id == other_person_id,
+                    Attendance.session_id == school_session_id,
+                )
+            )
+            if other_attendance.scalar_one_or_none() is not None:
+                skip_debit = True
 
-            product = await session.get(Product, sub.product_id)
-            if product is None or product.validity_days is None:
-                raise ValueError("subscription product")
-            sub.valid_until = on_date + timedelta(days=product.validity_days)
-        sub.lessons_left = max(0, sub.lessons_left - 1)
-        await session.flush()
+        if not skip_debit:
+            if sub.valid_until is None:
+                from app.models import Product
+
+                product = await session.get(Product, sub.product_id)
+                if product is None or product.validity_days is None:
+                    raise ValueError("subscription product")
+                sub.valid_until = on_date + timedelta(days=product.validity_days)
+            sub.lessons_left = max(0, sub.lessons_left - 1)
+            await session.flush()
         return attendance
 
     charge_result = await session.execute(

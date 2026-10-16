@@ -464,6 +464,7 @@ _LIST_PICK_INDEX_PURPOSES = frozenset(
         "grp_stream",
         "grp_assign",
         "ppl_add",
+        "sub_partner",
     }
 )
 
@@ -641,6 +642,8 @@ async def _list_pick_rows_from_data(
             if group is not None and group.archived_at is None:
                 rows.append(PickRow(id=group.id, full_name=group.name))
         return rows
+    if purpose == "sub_partner":
+        return await _pick_rows_for_ids(session, pick_ids, with_group_detail=False)
     return []
 
 
@@ -929,6 +932,47 @@ async def _prompt_open_sub_products(
     await message.answer("Выберите абонемент:", reply_markup=kb)
 
 
+async def _report_open_subscription(
+    message: Message,
+    state: FSMContext,
+    *,
+    person_id: str,
+    product_id: str,
+    partner_id: str | None = None,
+) -> None:
+    today = _today_local()
+    async with async_session_maker() as session:
+        person = await session.get(Person, person_id)
+        product = await session.get(Product, product_id)
+        partner = (
+            await session.get(Person, partner_id) if partner_id is not None else None
+        )
+        try:
+            await open_subscription(
+                session,
+                person_id,
+                product_id,
+                today,
+                partner_id=partner_id,
+            )
+            await session.commit()
+        except ValueError as exc:
+            await message.answer(str(exc))
+            return
+    await state.clear()
+    names: list[str] = []
+    if person is not None:
+        names.append(person.full_name)
+    if partner is not None:
+        names.append(partner.full_name)
+    title = (
+        f"Абонемент «{product.name}» выдан"
+        if product is not None
+        else "Абонемент выдан"
+    )
+    await message.answer(short_report(title, names))
+
+
 async def _after_people_pick(
     message: Message, state: FSMContext, person_id: str, purpose: str
 ) -> None:
@@ -937,6 +981,22 @@ async def _after_people_pick(
         return
     if purpose == "subscription":
         await _prompt_open_sub_products(message, state, person_id)
+        return
+    if purpose == "sub_partner":
+        data = await state.get_data()
+        primary_id = data.get("person_id")
+        product_id = data.get("product_id")
+        if not primary_id or not product_id:
+            await state.clear()
+            await message.answer("Ошибка")
+            return
+        await _report_open_subscription(
+            message,
+            state,
+            person_id=str(primary_id),
+            product_id=str(product_id),
+            partner_id=person_id,
+        )
         return
     if purpose == "card":
         await state.set_state(PeoplePickFSM.card_name)
@@ -1435,6 +1495,7 @@ class AssignGroupFSM(StatesGroup):
 
 class SubProductFSM(StatesGroup):
     name = State()
+    audience = State()
     lessons = State()
     validity = State()
     price = State()
@@ -1458,6 +1519,7 @@ class NewPriceFSM(StatesGroup):
 
 class ProductEditFSM(StatesGroup):
     name = State()
+    audience = State()
     lessons = State()
     validity = State()
 
@@ -2235,20 +2297,38 @@ async def cb_open_sub_product(query: CallbackQuery, state: FSMContext) -> None:
     if admin is None or not _is_admin(admin):
         await query.answer(REFUSAL, show_alert=True)
         return
-    today = _today_local()
+    await query.answer()
+    if query.message is None:
+        return
     async with async_session_maker() as session:
-        person = await session.get(Person, person_id)
         product = await session.get(Product, product_id)
-        await open_subscription(session, person_id, product_id, today)
-        await session.commit()
-        report = short_report(
-            f"Абонемент «{product.name}» выдан" if product else "Абонемент выдан",
-            [person.full_name] if person else [],
-        )
-    await state.clear()
-    await query.answer("Выдано")
-    if query.message:
-        await query.message.answer(report)
+        audience = getattr(product, "audience", None) or "person"
+        if audience == "couple":
+            rows = [
+                row
+                for row in await _list_client_pick_rows(session)
+                if row.id != person_id
+            ]
+            if not rows:
+                await query.message.answer("Нет других клиентов")
+                await state.clear()
+                return
+            await state.update_data(product_id=product_id)
+            await _start_list_pick(
+                query.message,
+                state,
+                purpose="sub_partner",
+                rows=rows,
+                title="Номер выберет второго человека пары.",
+                hint=HINT_INDEX,
+            )
+            return
+    await _report_open_subscription(
+        query.message,
+        state,
+        person_id=str(person_id),
+        product_id=product_id,
+    )
 
 
 @router.callback_query(F.data.startswith("new_price_p:"))
@@ -2765,9 +2845,36 @@ def _product_kind_label(kind: str) -> str:
     return "абонемент" if kind == "subscription" else "разовое"
 
 
+def _product_audience_label(audience: str | None) -> str:
+    if audience == "couple":
+        return "семейная пара"
+    return "1 человек"
+
+
+def _subscription_audience_keyboard(
+    prefix: str, *, include_same: bool = False
+) -> InlineKeyboardMarkup:
+    rows: list[list[InlineKeyboardButton]] = [
+        [InlineKeyboardButton(text="1 человек", callback_data=f"{prefix}:person")],
+        [
+            InlineKeyboardButton(
+                text="семейная пара", callback_data=f"{prefix}:couple"
+            )
+        ],
+    ]
+    if include_same:
+        rows.append(
+            [InlineKeyboardButton(text="то же", callback_data=f"{prefix}:same")]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
 async def _product_card_text(session: AsyncSession, product: Product, on_date: date) -> str:
     kind = _product_kind_label(product.kind)
     lines = [product.name, f"Тип: {kind}"]
+    if product.kind == "subscription":
+        audience = getattr(product, "audience", None) or "person"
+        lines.append(f"Для кого: {_product_audience_label(audience)}")
     if product.kind == "subscription" and product.lessons_count is not None:
         lines.append(
             f"Занятий: {product.lessons_count}, срок: {product.validity_days} дн."
@@ -2878,9 +2985,10 @@ async def fsm_prd_edit_name(message: Message, state: FSMContext) -> None:
     )
     await state.update_data(edit_name=name)
     if data.get("product_kind") == "subscription":
-        await state.set_state(ProductEditFSM.lessons)
+        await state.set_state(ProductEditFSM.audience)
         await message.answer(
-            "Число занятий. Чтобы оставить прежнее, отправьте «то же»."
+            "Для кого?",
+            reply_markup=_subscription_audience_keyboard("prd_aud", include_same=True),
         )
         return
     async with async_session_maker() as session:
@@ -2965,6 +3073,7 @@ async def fsm_prd_edit_validity(message: Message, state: FSMContext) -> None:
                 name,
                 lessons_count=lessons,
                 validity_days=validity,
+                audience=data.get("edit_audience"),
             )
             await session.commit()
         except ValueError:
@@ -2973,6 +3082,27 @@ async def fsm_prd_edit_validity(message: Message, state: FSMContext) -> None:
         final_name = product.name
     await state.clear()
     await message.answer(short_report(f"Продукт теперь «{final_name}»", []))
+
+
+@router.callback_query(F.data.startswith("prd_aud:"))
+async def cb_prd_edit_audience(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    choice = query.data.split(":", 1)[1]
+    if choice not in ("person", "couple", "same"):
+        return
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    edit_audience = None if choice == "same" else choice
+    await state.update_data(edit_audience=edit_audience)
+    await state.set_state(ProductEditFSM.lessons)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Число занятий. Чтобы оставить прежнее, отправьте «то же»."
+        )
 
 
 @router.callback_query(F.data.startswith("prd_ask:"))
@@ -4895,6 +5025,9 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         if purpose == "ppl_add":
             await _apply_ppl_add_choice(message, state, picked[0].id)
             return
+        if purpose == "sub_partner":
+            await _after_people_pick(message, state, picked[0].id, "sub_partner")
+            return
         return
 
     try:
@@ -5737,8 +5870,29 @@ async def fsm_sub_name(message: Message, state: FSMContext) -> None:
     if not message.text:
         return
     await state.update_data(sub_name=message.text.strip())
+    await state.set_state(SubProductFSM.audience)
+    await message.answer(
+        "Для кого?",
+        reply_markup=_subscription_audience_keyboard("sub_aud"),
+    )
+
+
+@router.callback_query(F.data.startswith("sub_aud:"))
+async def cb_sub_audience(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    audience = query.data.split(":", 1)[1]
+    if audience not in ("person", "couple"):
+        return
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    await state.update_data(sub_audience=audience)
     await state.set_state(SubProductFSM.lessons)
-    await message.answer("Число занятий:")
+    await query.answer()
+    if query.message:
+        await query.message.answer("Число занятий:")
 
 
 @router.message(SubProductFSM.lessons)
@@ -5792,6 +5946,7 @@ async def fsm_sub_price(message: Message, state: FSMContext) -> None:
             data["sub_name"],
             lessons_count=int(data["sub_lessons"]),
             validity_days=int(data["sub_validity"]),
+            audience=data.get("sub_audience", "person"),
         )
         await set_price(session, product.id, amount, today)
         await session.commit()

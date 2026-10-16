@@ -26,6 +26,43 @@ async def db_session() -> AsyncSession:
     await engine.dispose()
 
 
+async def _couple_and_session(
+    db_session: AsyncSession,
+    ends_at: datetime,
+) -> tuple[Person, Person, SchoolSession, Subscription]:
+    primary = Person(full_name="Primary", role="client", telegram_user_id=1001)
+    partner = Person(full_name="Partner", role="client", telegram_user_id=1002)
+    group = await create_group(db_session, "Main")
+    db_session.add_all([primary, partner])
+    await db_session.flush()
+    school_session = await create_session(
+        db_session,
+        group.id,
+        starts_at=ends_at.replace(hour=ends_at.hour - 1 if ends_at.hour else 18),
+        ends_at=ends_at,
+        place="Studio",
+        bring_notes=None,
+    )
+    drop_in = await create_product(db_session, "drop_in", "Visit")
+    await set_price(db_session, drop_in.id, Decimal("99.00"), date(2026, 1, 1))
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple sub",
+        lessons_count=5,
+        validity_days=90,
+        audience="couple",
+    )
+    sub = await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=date(2026, 7, 1),
+        partner_id=partner.id,
+    )
+    return primary, partner, school_session, sub
+
+
 async def _person_and_session(
     db_session: AsyncSession,
     ends_at: datetime,
@@ -203,3 +240,86 @@ async def test_unactivated_person_is_not_marked(db_session: AsyncSession) -> Non
     assert sub.lessons_left == 4
     n = await db_session.scalar(select(func.count()).select_from(Attendance))
     assert n == 0
+
+
+async def test_couple_both_marked_same_session_decrements_once(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 9, 10, 20, 0, tzinfo=minsk)
+    primary, partner, school_session, sub = await _couple_and_session(
+        db_session, ends
+    )
+
+    await mark_attendance(
+        db_session, primary.id, school_session.id, "client", marked_by_id=primary.id
+    )
+    await mark_attendance(
+        db_session, partner.id, school_session.id, "client", marked_by_id=partner.id
+    )
+
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 4
+
+    n = await db_session.scalar(select(func.count()).select_from(DropInCharge))
+    assert n == 0
+
+
+async def test_couple_partner_only_marked_decrements_once(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 9, 15, 20, 0, tzinfo=minsk)
+    _primary, partner, school_session, sub = await _couple_and_session(
+        db_session, ends
+    )
+
+    await mark_attendance(
+        db_session, partner.id, school_session.id, "client", marked_by_id=partner.id
+    )
+
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 4
+    assert sub.valid_until == date(2026, 12, 14)
+
+
+async def test_person_subscription_decrements_only_for_owner(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 10, 5, 20, 0, tzinfo=minsk)
+    owner, school_session = await _person_and_session(db_session, ends)
+    stranger = Person(full_name="Stranger", role="client", telegram_user_id=1003)
+    db_session.add(stranger)
+    await db_session.flush()
+
+    drop_in = await create_product(db_session, "drop_in", "Visit")
+    await set_price(db_session, drop_in.id, Decimal("99.00"), date(2026, 1, 1))
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Solo",
+        lessons_count=4,
+        validity_days=60,
+        audience="person",
+    )
+    sub = await open_subscription(
+        db_session, owner.id, product.id, started_on=date(2026, 9, 1)
+    )
+
+    await mark_attendance(
+        db_session, owner.id, school_session.id, "client", marked_by_id=owner.id
+    )
+    await mark_attendance(
+        db_session,
+        stranger.id,
+        school_session.id,
+        "client",
+        marked_by_id=stranger.id,
+    )
+
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 3
+
+    n = await db_session.scalar(select(func.count()).select_from(DropInCharge))
+    assert n == 1

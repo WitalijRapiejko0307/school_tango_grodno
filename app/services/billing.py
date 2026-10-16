@@ -3,10 +3,37 @@
 from datetime import date
 from decimal import Decimal
 
-from sqlalchemy import select
+from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models import Price, Product, Subscription
+
+_VALID_AUDIENCES = frozenset({"person", "couple"})
+
+
+def _validate_audience(audience: str) -> None:
+    if audience not in _VALID_AUDIENCES:
+        raise ValueError(f"audience must be one of: person, couple")
+
+
+async def _has_active_couple_subscription(
+    session: AsyncSession, person_id: str, on_date: date
+) -> bool:
+    result = await session.execute(
+        select(Subscription.id)
+        .where(
+            Subscription.partner_id.isnot(None),
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            ),
+            Subscription.lessons_left > 0,
+            (Subscription.valid_until.is_(None))
+            | (Subscription.valid_until >= on_date),
+        )
+        .limit(1)
+    )
+    return result.scalar_one_or_none() is not None
 
 
 async def create_product(
@@ -15,7 +42,9 @@ async def create_product(
     name: str,
     lessons_count: int | None = None,
     validity_days: int | None = None,
+    audience: str = "person",
 ) -> Product:
+    _validate_audience(audience)
     if kind == "subscription":
         if lessons_count is None or validity_days is None:
             raise ValueError(
@@ -32,6 +61,7 @@ async def create_product(
         name=name,
         lessons_count=lessons_count,
         validity_days=validity_days,
+        audience=audience,
     )
     session.add(product)
     await session.flush()
@@ -70,6 +100,7 @@ async def open_subscription(
     person_id: str,
     product_id: str,
     started_on: date,
+    partner_id: str | None = None,
 ) -> Subscription:
     result = await session.execute(
         select(Product).where(Product.id == product_id)
@@ -80,9 +111,25 @@ async def open_subscription(
     if product.lessons_count is None or product.validity_days is None:
         raise ValueError("subscription product missing lessons_count or validity_days")
 
-    del started_on
+    if product.audience == "couple":
+        if partner_id is None:
+            raise ValueError("couple subscription requires partner_id")
+        if partner_id == person_id:
+            raise ValueError("partner must differ from the primary person")
+        for pid in (person_id, partner_id):
+            if await _has_active_couple_subscription(session, pid, started_on):
+                raise ValueError(
+                    "person already has an active couple subscription"
+                )
+    elif product.audience == "person":
+        if partner_id is not None:
+            raise ValueError("person subscription must not have a partner")
+    else:
+        raise ValueError(f"unknown product audience: {product.audience}")
+
     subscription = Subscription(
         person_id=person_id,
+        partner_id=partner_id,
         product_id=product_id,
         lessons_left=product.lessons_count,
         valid_until=None,
@@ -98,7 +145,10 @@ async def active_subscription(
     result = await session.execute(
         select(Subscription)
         .where(
-            Subscription.person_id == person_id,
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            ),
             Subscription.lessons_left > 0,
             (Subscription.valid_until.is_(None))
             | (Subscription.valid_until >= on_date),
@@ -122,6 +172,7 @@ async def update_product(
     name: str,
     lessons_count: int | None = None,
     validity_days: int | None = None,
+    audience: str | None = None,
 ) -> Product:
     product = await _get_product(session, product_id)
     stripped = name.strip()
@@ -142,6 +193,9 @@ async def update_product(
     elif product.kind == "drop_in":
         product.lessons_count = None
         product.validity_days = None
+    if audience is not None:
+        _validate_audience(audience)
+        product.audience = audience
     await session.flush()
     return product
 
