@@ -1,22 +1,133 @@
-import pytest
-from httpx import ASGITransport, AsyncClient
+from datetime import date, time
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock
 
-from unittest.mock import AsyncMock
+import pytest
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.storage.memory import MemoryStorage
+from httpx import ASGITransport, AsyncClient
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.channels.telegram import (
+    cb_once_cancel,
+    fsm_week_notes,
     reminder_inline_markup,
     reminder_reply_keyboard,
     reply_markup_for_role,
     role_keyboard,
     send_due_reminder,
 )
-from app.services.notifications import DueReminder
 from app.config import get_settings
+from app.db import Base
+from app.models import Person
+from app.services.notifications import DueReminder
+from app.services.schedule import assign_group, create_group, create_weekly_slot
 
 
 @pytest.fixture
 def anyio_backend() -> str:
     return "asyncio"
+
+
+@pytest.fixture
+async def telegram_db(monkeypatch: pytest.MonkeyPatch):
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:", echo=False)
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
+    monkeypatch.setattr("app.channels.telegram.async_session_maker", factory)
+    yield factory
+    await engine.dispose()
+
+
+async def _fsm_context(user_id: int = 9001) -> FSMContext:
+    storage = MemoryStorage()
+    return FSMContext(
+        storage=storage,
+        key=MagicMock(user_id=user_id, chat_id=user_id, bot_id=1),
+    )
+
+
+async def _seed_group_slot_member(
+    factory: async_sessionmaker[AsyncSession],
+    *,
+    admin_tg: int = 9001,
+    member_tg: int = 1001,
+    on_date: date = date(2026, 10, 14),
+):
+    async with factory() as session:
+        admin = Person(full_name="Admin", role="admin", telegram_user_id=admin_tg)
+        member = Person(full_name="Member", role="client", telegram_user_id=member_tg)
+        session.add_all([admin, member])
+        group = await create_group(session, "Начинающие")
+        await assign_group(session, member.id, group.id, on_date)
+        slot = await create_weekly_slot(
+            session,
+            group.id,
+            on_date.weekday(),
+            time(16, 0),
+            time(17, 0),
+            "зал",
+            None,
+        )
+        await session.commit()
+        return slot.id, on_date
+
+
+async def test_cb_once_cancel_notifies_group_audience(telegram_db) -> None:
+    slot_id, on_date = await _seed_group_slot_member(telegram_db)
+    state = await _fsm_context()
+    await state.update_data(slot_id=slot_id, once_date=on_date.strftime("%d-%m-%Y"))
+
+    bot = AsyncMock()
+    message = AsyncMock()
+    query = MagicMock()
+    query.from_user = SimpleNamespace(id=9001)
+    query.bot = bot
+    query.message = message
+    query.answer = AsyncMock()
+
+    await cb_once_cancel(query, state)
+
+    bot.send_message.assert_awaited_once()
+    assert bot.send_message.await_args.args[0] == 1001
+    assert "отменено" in bot.send_message.await_args.args[1]
+    message.answer.assert_awaited_once()
+    admin_reply = message.answer.await_args.args[0]
+    assert "отменено" in admin_reply
+    assert "Доставлено:" in admin_reply
+
+
+async def test_fsm_week_notes_edit_one_notifies_reschedule(telegram_db) -> None:
+    slot_id, on_date = await _seed_group_slot_member(telegram_db)
+    state = await _fsm_context()
+    await state.update_data(
+        mode="edit_one",
+        slot_id=slot_id,
+        once_date=on_date.strftime("%d-%m-%Y"),
+        slot_time="18:00",
+        slot_duration="60",
+        slot_place="зал 2",
+    )
+
+    bot = AsyncMock()
+    message = AsyncMock()
+    message.from_user = SimpleNamespace(id=9001)
+    message.bot = bot
+    message.text = "—"
+    message.answer = AsyncMock()
+
+    await fsm_week_notes(message, state)
+
+    bot.send_message.assert_awaited_once()
+    notice = bot.send_message.await_args.args[1]
+    assert "перенесено" in notice
+    assert "Было" in notice
+    assert "Стало" in notice
+    assert "зал 2" in notice
+    admin_reply = message.answer.await_args.args[0]
+    assert "перенесено" in admin_reply
+    assert "Доставлено:" in admin_reply
 
 
 async def test_health_ok() -> None:

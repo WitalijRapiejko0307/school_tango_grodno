@@ -128,6 +128,7 @@ from app.services.schedule import (
     create_stream,
     create_weekly_slot,
     deactivate_weekly_slot,
+    ensure_occurrence,
     group_transfer_confirmation_text,
     materialize_range,
     override_occurrence,
@@ -5712,7 +5713,12 @@ async def fsm_once_date(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == "once_cancel")
 async def cb_once_cancel(query: CallbackQuery, state: FSMContext) -> None:
     data = await state.get_data()
-    if query.from_user is None or "slot_id" not in data or "once_date" not in data:
+    if (
+        query.from_user is None
+        or query.bot is None
+        or "slot_id" not in data
+        or "once_date" not in data
+    ):
         await query.answer("Начните заново")
         return
     on_date = parse_dmy(data["once_date"])
@@ -5721,14 +5727,19 @@ async def cb_once_cancel(query: CallbackQuery, state: FSMContext) -> None:
         if admin is None or not _is_admin(admin):
             await query.answer(REFUSAL, show_alert=True)
             return
-        await cancel_occurrence(session, data["slot_id"], on_date)
+        slot = await session.get(WeeklySlot, data["slot_id"])
+        school_session = await cancel_occurrence(session, data["slot_id"], on_date)
+        group_name = await _session_group_name(session, slot.group_id)
+        audience = await notice_audience(session, school_session.id)
+        text = cancel_notice_text(
+            group_name, school_session.starts_at, school_session.place
+        )
         await session.commit()
+    report, _, _ = await _send_notice(query.bot, audience, text)
     await state.clear()
     await query.answer("Отменено")
     if query.message:
-        await query.message.answer(
-            f"Занятие {format_school_date(on_date)} отменено. Остальные недели без изменений."
-        )
+        await query.message.answer(f"{text}\n\n{report}")
 
 
 @router.callback_query(F.data == "once_move")
@@ -5794,6 +5805,8 @@ async def fsm_week_notes(message: Message, state: FSMContext) -> None:
         await state.set_state(WeekFSM.duration)
         return
     mode = data.get("mode", "new")
+    audience: list[Person] | None = None
+    notice_text: str | None = None
     async with async_session_maker() as session:
         admin = await _person_by_telegram(session, message.from_user.id)
         if admin is None or not _is_admin(admin):
@@ -5802,10 +5815,19 @@ async def fsm_week_notes(message: Message, state: FSMContext) -> None:
             return
         if mode == "edit_one":
             on_date = parse_dmy(data["once_date"])
-            await override_occurrence(
+            slot = await session.get(WeeklySlot, data["slot_id"])
+            old_session = await ensure_occurrence(session, slot, on_date)
+            old_starts = old_session.starts_at
+            old_place = old_session.place
+            group_name = await _session_group_name(session, slot.group_id)
+            audience = await notice_audience(session, old_session.id)
+            updated = await override_occurrence(
                 session, data["slot_id"], on_date, start, end, data["slot_place"], notes or None
             )
-            text = f"Изменено только {format_school_date(on_date)}."
+            notice_text = reschedule_notice_text(
+                group_name, old_starts, old_place, updated.starts_at, updated.place
+            )
+            text = notice_text
         elif mode == "edit_all":
             await update_weekly_slot(
                 session,
@@ -5829,6 +5851,9 @@ async def fsm_week_notes(message: Message, state: FSMContext) -> None:
             )
             text = "Недельный слот создан. Отдельные даты вводить не нужно."
         await session.commit()
+    if mode == "edit_one" and message.bot is not None and audience is not None and notice_text is not None:
+        report, _, _ = await _send_notice(message.bot, audience, notice_text)
+        text = f"{notice_text}\n\n{report}"
     await message.answer(text)
     await state.clear()
 
