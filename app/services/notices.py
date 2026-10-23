@@ -41,15 +41,18 @@ def delivery_report(delivered: int, failed: int) -> str:
 
 
 async def upcoming_sessions(
-    session: AsyncSession, now: datetime
+    session: AsyncSession, now: datetime, *, group_id: str | None = None
 ) -> list[tuple[SchoolSession, str]]:
+    conditions = [
+        SchoolSession.starts_at >= now,
+        SchoolSession.status == "scheduled",
+    ]
+    if group_id is not None:
+        conditions.append(SchoolSession.group_id == group_id)
     result = await session.execute(
         select(SchoolSession, Group.name)
         .join(Group, Group.id == SchoolSession.group_id)
-        .where(
-            SchoolSession.starts_at >= now,
-            SchoolSession.status == "scheduled",
-        )
+        .where(*conditions)
         .order_by(SchoolSession.starts_at)
     )
     return list(result.all())
