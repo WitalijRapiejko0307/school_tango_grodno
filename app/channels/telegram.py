@@ -1178,22 +1178,8 @@ async def _apply_assign_group_choice(
                 membership.started_on,
                 new_group.name,
             )
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Перевести",
-                            callback_data=f"assign_go:{person_id}:{group_id}",
-                        )
-                    ],
-                    [
-                        InlineKeyboardButton(
-                            text="Отмена", callback_data="assign_cancel"
-                        )
-                    ],
-                ]
-            )
-            await message.answer(text, reply_markup=kb)
+            await state.update_data(assign_group_id=group_id)
+            await message.answer(text, reply_markup=_transfer_confirm_keyboard())
             return
     await _finish_assign_group_message(message, state, person_id, group_id)
 
@@ -2223,29 +2209,33 @@ async def cb_assign_group(query: CallbackQuery, state: FSMContext) -> None:
                 membership.started_on,
                 new_group.name,
             )
-            kb = InlineKeyboardMarkup(
-                inline_keyboard=[
-                    [
-                        InlineKeyboardButton(
-                            text="Перевести",
-                            callback_data=f"assign_go:{person_id}:{group_id}",
-                        )
-                    ],
-                    [InlineKeyboardButton(text="Отмена", callback_data="assign_cancel")],
-                ]
-            )
+            await state.update_data(assign_group_id=group_id)
             await query.answer()
             if query.message:
-                await query.message.answer(text, reply_markup=kb)
+                await query.message.answer(
+                    text, reply_markup=_transfer_confirm_keyboard()
+                )
             return
     await _finish_assign_group(query, state, person_id, group_id)
 
 
-@router.callback_query(F.data.startswith("assign_go:"))
+def _transfer_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [InlineKeyboardButton(text="Перевести", callback_data="assign_go")],
+            [InlineKeyboardButton(text="Отмена", callback_data="assign_cancel")],
+        ]
+    )
+
+
+@router.callback_query(F.data == "assign_go")
 async def cb_assign_group_confirm(query: CallbackQuery, state: FSMContext) -> None:
-    if query.data is None:
+    data = await state.get_data()
+    person_id = data.get("person_id")
+    group_id = data.get("assign_group_id")
+    if not person_id or not group_id:
+        await query.answer("Сначала выберите человека", show_alert=True)
         return
-    _, person_id, group_id = query.data.split(":", 2)
     admin = await _person_for_callback(query)
     if admin is None or not _is_admin(admin):
         await query.answer(REFUSAL, show_alert=True)

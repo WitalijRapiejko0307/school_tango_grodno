@@ -232,5 +232,8 @@ async def telegram_webhook(request: Request) -> dict[str, bool]:
     dispatcher: Dispatcher = request.app.state.dispatcher
     payload = await request.json()
     update = Update.model_validate(payload, context={"bot": bot})
-    await dispatcher.feed_update(bot, update)
+    try:
+        await dispatcher.feed_update(bot, update)
+    except Exception:
+        logger.exception("Telegram update failed")
     return {"ok": True}
