@@ -334,6 +334,48 @@ def _is_admin(person: Person) -> bool:
     return person.role == "admin"
 
 
+async def _require_admin_message(
+    message: Message, session: AsyncSession
+) -> Person | None:
+    if message.from_user is None:
+        await message.answer("")
+        return None
+    person = await _person_by_telegram(session, message.from_user.id)
+    if person is None or not _is_admin(person):
+        await message.answer(REFUSAL if person and not _is_admin(person) else "")
+        return None
+    return person
+
+
+async def _require_admin_message_strict(
+    message: Message, session: AsyncSession
+) -> Person | None:
+    if message.from_user is None:
+        await message.answer(REFUSAL)
+        return None
+    person = await _person_by_telegram(session, message.from_user.id)
+    if person is None or not _is_admin(person):
+        await message.answer(REFUSAL)
+        return None
+    return person
+
+
+async def _require_admin_callback(
+    query: CallbackQuery, session: AsyncSession | None = None
+) -> Person | None:
+    if query.from_user is None:
+        await query.answer(REFUSAL, show_alert=True)
+        return None
+    if session is None:
+        person = await _person_for_callback(query)
+    else:
+        person = await _person_by_telegram(session, query.from_user.id)
+    if person is None or not _is_admin(person):
+        await query.answer(REFUSAL, show_alert=True)
+        return None
+    return person
+
+
 async def _list_today_sessions(session: AsyncSession, day: date) -> list[SchoolSession]:
     tz = _school_tz()
     day_start = datetime(day.year, day.month, day.day, tzinfo=tz)
@@ -2008,9 +2050,7 @@ async def cb_admin_session(
     if query.data is None:
         return
     school_session_id = query.data.split(":", 1)[1]
-    person = await _person_for_callback(query)
-    if person is None or not _is_admin(person):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer()
     if query.message:
@@ -2130,9 +2170,7 @@ async def cb_pick_roster_group(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(RosterFSM.active)
     await state.update_data(group_id=group_id, drafts=[])
@@ -2148,9 +2186,7 @@ async def cb_pick_group_slot(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    person = await _person_for_callback(query)
-    if person is None or not _is_admin(person):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.update_data(mode="new", group_id=group_id)
     await query.answer()
@@ -2171,9 +2207,7 @@ async def cb_assign_group(query: CallbackQuery, state: FSMContext) -> None:
     if not person_id:
         await query.answer("Сначала выберите человека")
         return
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         target = await session.get(Person, person_id)
@@ -2223,18 +2257,14 @@ async def cb_assign_group_confirm(query: CallbackQuery, state: FSMContext) -> No
     if not person_id or not group_id:
         await query.answer("Сначала выберите человека", show_alert=True)
         return
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await _finish_assign_group(query, state, person_id, group_id)
 
 
 @router.callback_query(F.data == "assign_cancel")
 async def cb_assign_group_cancel(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer("Отменено")
     if query.message:
@@ -2246,9 +2276,7 @@ async def cb_open_sub_person(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer()
     if query.message:
@@ -2265,9 +2293,7 @@ async def cb_open_sub_product(query: CallbackQuery, state: FSMContext) -> None:
     if not person_id:
         await query.answer("Ошибка")
         return
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer()
     if query.message is None:
@@ -2308,9 +2334,7 @@ async def cb_new_price_product(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     product_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(NewPriceFSM.amount)
     await state.update_data(product_id=product_id)
@@ -2321,9 +2345,7 @@ async def cb_new_price_product(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin_new_group")
 async def cb_admin_new_group(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(NewGroupFSM.name)
     await query.answer()
@@ -2333,9 +2355,7 @@ async def cb_admin_new_group(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin_slot")
 async def cb_admin_slot(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         groups = await _list_active_groups(session)
@@ -2357,9 +2377,7 @@ async def cb_admin_slot(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "people_assign")
 async def cb_people_assign(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         rows = await _list_non_admin_pick_rows(session)
@@ -2379,9 +2397,7 @@ async def cb_people_assign(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ppl_card")
 async def cb_people_card(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         rows = await _list_non_admin_pick_rows(session)
@@ -2401,9 +2417,7 @@ async def cb_people_card(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ppl_leave")
 async def cb_people_leave(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         rows = await _list_non_admin_pick_rows(session)
@@ -2441,9 +2455,7 @@ async def cb_people_leave(query: CallbackQuery, state: FSMContext) -> None:
     )
 )
 async def cb_list_pick_more(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     current = await state.get_state()
     if current != ListPickFSM.waiting.state:
@@ -2472,9 +2484,7 @@ async def cb_list_pick_more(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "pp_more")
 async def cb_people_pick_more(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     data = await state.get_data()
     pick_ids: list[str] = list(data.get("pick_ids") or [])
@@ -2502,9 +2512,7 @@ async def cb_people_leave_confirm(query: CallbackQuery, state: FSMContext) -> No
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     today = _today_local()
     async with async_session_maker() as session:
@@ -2532,9 +2540,7 @@ async def cb_people_leave_confirm(query: CallbackQuery, state: FSMContext) -> No
 
 @router.callback_query(F.data == "ppl_leave_cancel")
 async def cb_people_leave_cancel(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.clear()
     await query.answer("Отменено")
@@ -2544,9 +2550,7 @@ async def cb_people_leave_cancel(query: CallbackQuery, state: FSMContext) -> Non
 
 @router.callback_query(F.data == "ppl_list")
 async def cb_ppl_list(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         rows = await _list_active_client_pick_rows(session)
@@ -2566,9 +2570,7 @@ async def cb_ppl_list(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ppl_add")
 async def cb_ppl_add(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(PeopleAddFSM.name)
     await query.answer()
@@ -2578,9 +2580,7 @@ async def cb_ppl_add(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ppl_arch")
 async def cb_ppl_arch(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         archived = await _list_archived_client_rows(session)
@@ -2608,9 +2608,7 @@ async def cb_ppl_restore(query: CallbackQuery) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         person = await session.get(Person, person_id)
@@ -2629,9 +2627,7 @@ async def cb_ppl_arch_ask(query: CallbackQuery) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         person = await session.get(Person, person_id)
@@ -2657,9 +2653,7 @@ async def cb_ppl_arch_ask(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "ppl_arch_cancel")
 async def cb_ppl_arch_cancel(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer("Отменено")
     if query.message:
@@ -2671,9 +2665,7 @@ async def cb_ppl_arch_yes(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     now = datetime.now(UTC)
     today = _today_local()
@@ -2699,9 +2691,7 @@ async def cb_ppl_to_grp(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer()
     if query.message:
@@ -2713,9 +2703,7 @@ async def cb_ppl_from_grp(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer()
     if query.message:
@@ -2727,9 +2715,7 @@ async def cb_ppl_edit(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     person_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         person = await session.get(Person, person_id)
@@ -2745,9 +2731,7 @@ async def cb_ppl_edit(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "price_sub")
 async def cb_price_sub(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(SubProductFSM.name)
     await query.answer()
@@ -2757,9 +2741,7 @@ async def cb_price_sub(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "price_dropin")
 async def cb_price_dropin(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(DropInProductFSM.name)
     await query.answer()
@@ -2769,9 +2751,7 @@ async def cb_price_dropin(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "price_open_sub")
 async def cb_price_open_sub(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         rows = await _list_client_pick_rows(session)
@@ -2791,9 +2771,7 @@ async def cb_price_open_sub(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "price_new_price")
 async def cb_price_new_price(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         products = list(
@@ -2888,9 +2866,7 @@ async def cb_prd_card(query: CallbackQuery) -> None:
     if query.data is None:
         return
     product_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         product = await session.get(Product, product_id)
@@ -2907,9 +2883,7 @@ async def cb_prd_rename(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     product_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         product = await session.get(Product, product_id)
@@ -2945,9 +2919,7 @@ async def fsm_prd_edit_name(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
     name = (
@@ -2964,9 +2936,7 @@ async def fsm_prd_edit_name(message: Message, state: FSMContext) -> None:
         )
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         try:
@@ -2989,9 +2959,7 @@ async def fsm_prd_edit_lessons(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
     if message.text.strip().lower() == "то же":
@@ -3017,9 +2985,7 @@ async def fsm_prd_edit_validity(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
     if message.text.strip().lower() == "то же":
@@ -3033,9 +2999,7 @@ async def fsm_prd_edit_validity(message: Message, state: FSMContext) -> None:
     name = data["edit_name"]
     lessons = data["edit_lessons"]
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         try:
@@ -3063,9 +3027,7 @@ async def cb_prd_edit_audience(query: CallbackQuery, state: FSMContext) -> None:
     choice = query.data.split(":", 1)[1]
     if choice not in ("person", "couple", "same"):
         return
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     edit_audience = None if choice == "same" else choice
     await state.update_data(edit_audience=edit_audience)
@@ -3082,9 +3044,7 @@ async def cb_prd_deactivate_ask(query: CallbackQuery) -> None:
     if query.data is None:
         return
     product_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         product = await session.get(Product, product_id)
@@ -3113,9 +3073,7 @@ async def cb_prd_deactivate_ask(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "prd_cancel")
 async def cb_prd_cancel(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer("Отменено")
     if query.message:
@@ -3127,9 +3085,7 @@ async def cb_prd_deactivate_yes(query: CallbackQuery) -> None:
     if query.data is None:
         return
     product_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         product = await session.get(Product, product_id)
@@ -3145,9 +3101,7 @@ async def cb_prd_deactivate_yes(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "prd_arch")
 async def cb_prd_arch_list(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         products = list(
@@ -3183,9 +3137,7 @@ async def cb_prd_restore(query: CallbackQuery) -> None:
     if query.data is None:
         return
     product_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         product = await session.get(Product, product_id)
@@ -3201,9 +3153,7 @@ async def cb_prd_restore(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "admin_invite")
 async def cb_admin_invite(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(AdminInviteFSM.waiting_identifier)
     await query.answer()
@@ -3213,9 +3163,7 @@ async def cb_admin_invite(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin_contact")
 async def cb_admin_contact(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.set_state(ContactFSM.name)
     await query.answer()
@@ -3228,9 +3176,7 @@ async def cb_adm_demote_ask(query: CallbackQuery) -> None:
     if query.data is None:
         return
     target_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         target = await session.get(Person, target_id)
@@ -3255,9 +3201,7 @@ async def cb_adm_demote_ask(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "adm_cancel")
 async def cb_adm_demote_cancel(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer("Отменено")
     if query.message:
@@ -3269,9 +3213,8 @@ async def cb_adm_demote_yes(query: CallbackQuery) -> None:
     if query.data is None:
         return
     target_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    admin = await _require_admin_callback(query)
+    if admin is None:
         return
     async with async_session_maker() as session:
         target = await session.get(Person, target_id)
@@ -3295,9 +3238,7 @@ async def cb_ctc_card(query: CallbackQuery) -> None:
     if query.data is None:
         return
     contact_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         card = await session.get(ContactCard, contact_id)
@@ -3327,9 +3268,7 @@ async def cb_ctc_edit_start(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     contact_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         card = await session.get(ContactCard, contact_id)
@@ -3348,9 +3287,7 @@ async def cb_ctc_archive_ask(query: CallbackQuery) -> None:
     if query.data is None:
         return
     contact_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         card = await session.get(ContactCard, contact_id)
@@ -3375,9 +3312,7 @@ async def cb_ctc_archive_ask(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "ctc_cancel")
 async def cb_ctc_archive_cancel(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer("Отменено")
     if query.message:
@@ -3389,9 +3324,7 @@ async def cb_ctc_archive_yes(query: CallbackQuery) -> None:
     if query.data is None:
         return
     contact_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     now = datetime.now(UTC)
     async with async_session_maker() as session:
@@ -3408,9 +3341,7 @@ async def cb_ctc_archive_yes(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "ctc_arch")
 async def cb_ctc_arch_list(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         cards = await list_contacts(session, archived=True)
@@ -3438,9 +3369,7 @@ async def cb_ctc_restore(query: CallbackQuery) -> None:
     if query.data is None:
         return
     contact_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         try:
@@ -3550,9 +3479,7 @@ async def _send_group_card(message: Message, group_id: str) -> None:
 @router.message(F.text == BTN_GROUPS)
 async def menu_groups(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
-        if person is None or not _is_admin(person):
-            await message.answer(REFUSAL if person and not _is_admin(person) else "")
+        if await _require_admin_message(message, session) is None:
             return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -3566,9 +3493,7 @@ async def menu_groups(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "grp_list")
 async def cb_grp_list(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         groups = await _list_active_groups(session)
@@ -3593,9 +3518,7 @@ async def cb_grp_card(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3612,9 +3535,7 @@ async def cb_grp_stream(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3636,9 +3557,7 @@ async def cb_grp_slotadd(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3659,9 +3578,7 @@ async def cb_grp_week(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3691,9 +3608,7 @@ async def cb_grp_once(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3725,9 +3640,7 @@ async def cb_grp_schedule(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3762,9 +3675,7 @@ async def cb_grp_rename(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3790,9 +3701,7 @@ async def fsm_grp_rename(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         group = await session.get(Group, group_id)
@@ -3813,9 +3722,7 @@ async def cb_grp_archive_ask(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3844,9 +3751,7 @@ async def cb_grp_archive_ask(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "grp_cancel")
 async def cb_grp_cancel(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await query.answer("Отменено")
     if query.message:
@@ -3858,9 +3763,7 @@ async def cb_grp_archive_yes(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     now = datetime.now(UTC)
     async with async_session_maker() as session:
@@ -3885,9 +3788,7 @@ async def cb_grp_archive_yes(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "grp_arch")
 async def cb_grp_arch_list(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         groups = await _list_archived_groups(session)
@@ -3915,9 +3816,7 @@ async def cb_grp_restore(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -3936,9 +3835,7 @@ async def cb_grp_restore(query: CallbackQuery) -> None:
 
 @router.callback_query(F.data == "slot_off")
 async def cb_slot_off(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         groups = await _list_active_groups(session)
@@ -3965,9 +3862,7 @@ async def cb_slot_off_group(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -4020,9 +3915,7 @@ async def cb_slot_arch_list(query: CallbackQuery) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -4068,9 +3961,7 @@ async def cb_slot_deactivate_ask(query: CallbackQuery) -> None:
     if query.data is None:
         return
     slot_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         slot = await session.get(WeeklySlot, slot_id)
@@ -4103,9 +3994,7 @@ async def cb_slot_deactivate_yes(query: CallbackQuery) -> None:
     if query.data is None:
         return
     slot_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         slot = await session.get(WeeklySlot, slot_id)
@@ -4124,9 +4013,7 @@ async def cb_slot_restore(query: CallbackQuery) -> None:
     if query.data is None:
         return
     slot_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         slot = await session.get(WeeklySlot, slot_id)
@@ -4143,9 +4030,7 @@ async def cb_slot_restore(query: CallbackQuery) -> None:
 @router.message(F.text == BTN_PEOPLE)
 async def menu_people(message: Message) -> None:
     async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
-        if person is None or not _is_admin(person):
-            await message.answer(REFUSAL if person and not _is_admin(person) else "")
+        if await _require_admin_message(message, session) is None:
             return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
@@ -4245,9 +4130,7 @@ async def menu_price(message: Message, state: FSMContext) -> None:
 @router.message(F.text == BTN_REMINDERS)
 async def menu_reminders(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
-        if person is None or not _is_admin(person):
-            await message.answer(REFUSAL if person and not _is_admin(person) else "")
+        if await _require_admin_message(message, session) is None:
             return
         today = _today_local()
         summary = await list_today_session_reminder_summary(session, today)
@@ -4278,9 +4161,7 @@ async def menu_reminders(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ppl_guests")
 async def cb_ppl_guests(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         today = _today_local()
@@ -4322,9 +4203,7 @@ async def cb_ppl_guests(query: CallbackQuery, state: FSMContext) -> None:
 @router.message(F.text == BTN_ROSTER)
 async def menu_roster(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
-        if person is None or not _is_admin(person):
-            await message.answer(REFUSAL if person and not _is_admin(person) else "")
+        if await _require_admin_message(message, session) is None:
             return
         groups = await _list_active_groups(session)
     await state.clear()
@@ -4406,9 +4285,7 @@ async def fsm_roster_text(message: Message, state: FSMContext) -> None:
     if not text:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
 
@@ -4550,9 +4427,10 @@ async def cb_notice_session(query: CallbackQuery) -> None:
         return
     session_id = query.data.split(":", 1)[1]
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, query.from_user.id)
+        if await _require_admin_callback(query, session) is None:
+            return
         school_session = await session.get(SchoolSession, session_id)
-        if admin is None or not _is_admin(admin) or school_session is None:
+        if school_session is None:
             await query.answer(REFUSAL, show_alert=True)
             return
     await query.answer()
@@ -4565,9 +4443,7 @@ async def cb_notice_move(query: CallbackQuery, state: FSMContext) -> None:
         return
     session_id = query.data.split(":", 1)[1]
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, query.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await query.answer(REFUSAL, show_alert=True)
+        if await _require_admin_callback(query, session) is None:
             return
     await state.set_state(NoticeFSM.move_when)
     await state.update_data(session_id=session_id)
@@ -4601,9 +4477,11 @@ async def fsm_notice_place(message: Message, state: FSMContext) -> None:
         return
     new_starts = datetime.fromisoformat(raw_starts)
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
         school_session = await session.get(SchoolSession, session_id)
-        if admin is None or not _is_admin(admin) or school_session is None:
+        if school_session is None:
             await message.answer(REFUSAL)
             await state.clear()
             return
@@ -4637,9 +4515,10 @@ async def cb_notice_cancel(query: CallbackQuery) -> None:
         return
     session_id = query.data.split(":", 1)[1]
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, query.from_user.id)
+        if await _require_admin_callback(query, session) is None:
+            return
         school_session = await session.get(SchoolSession, session_id)
-        if admin is None or not _is_admin(admin) or school_session is None:
+        if school_session is None:
             await query.answer(REFUSAL, show_alert=True)
             return
         group_name = await _session_group_name(session, school_session.group_id)
@@ -4712,9 +4591,7 @@ async def cb_notice_group(query: CallbackQuery, state: FSMContext) -> None:
         return
     group_id = query.data.split(":", 1)[1]
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, query.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await query.answer(REFUSAL, show_alert=True)
+        if await _require_admin_callback(query, session) is None:
             return
     await state.set_state(NoticeFSM.text)
     await state.update_data(group_id=group_id, person_id=None)
@@ -4728,9 +4605,7 @@ async def fsm_notice_text(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         if data.get("group_id"):
@@ -4749,9 +4624,7 @@ async def fsm_notice_text(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "ppl_admins")
 async def cb_ppl_admins(query: CallbackQuery) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         kb = await _admins_menu_keyboard(session)
@@ -4940,10 +4813,9 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
     if message.from_user is None or message.text is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-    if admin is None or not _is_admin(admin):
-        await message.answer(REFUSAL)
-        return
+        admin = await _require_admin_message_strict(message, session)
+        if admin is None:
+            return
     data = await state.get_data()
     purpose = str(data.get("pick_purpose") or "")
     async with async_session_maker() as session:
@@ -5095,11 +4967,9 @@ async def fsm_list_pick_notice_text(message: Message, state: FSMContext) -> None
     if message.text is None or message.from_user is None or message.bot is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-    if admin is None or not _is_admin(admin):
-        await message.answer(REFUSAL)
-        await state.clear()
-        return
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
     data = await state.get_data()
     purpose = str(data.get("notice_purpose") or "")
     pick_ids: list[str] = list(data.get("notice_pick_ids") or [])  # type: ignore[arg-type]
@@ -5124,10 +4994,8 @@ async def fsm_people_add_name(message: Message, state: FSMContext) -> None:
     if message.from_user is None or message.text is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-    if admin is None or not _is_admin(admin):
-        await message.answer(REFUSAL)
-        return
+        if await _require_admin_message_strict(message, session) is None:
+            return
     items = parse_roster_line(message.text)
     item = items[0] if items else None
     if item is None or item.needs_fix or item.name_key is None:
@@ -5159,10 +5027,8 @@ async def fsm_people_pick_waiting(message: Message, state: FSMContext) -> None:
     if message.from_user is None or message.text is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-    if admin is None or not _is_admin(admin):
-        await message.answer(REFUSAL)
-        return
+        if await _require_admin_message_strict(message, session) is None:
+            return
     data = await state.get_data()
     pick_ids: list[str] = list(data.get("pick_ids") or [])
     purpose = str(data.get("pick_purpose") or "")
@@ -5200,10 +5066,8 @@ async def fsm_people_card_name(message: Message, state: FSMContext) -> None:
     if message.from_user is None or message.text is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-    if admin is None or not _is_admin(admin):
-        await message.answer(REFUSAL)
-        return
+        if await _require_admin_message_strict(message, session) is None:
+            return
     data = await state.get_data()
     person_id = data.get("card_person_id")
     if not person_id:
@@ -5229,10 +5093,8 @@ async def fsm_people_card_phone(message: Message, state: FSMContext) -> None:
     if message.from_user is None or message.text is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-    if admin is None or not _is_admin(admin):
-        await message.answer(REFUSAL)
-        return
+        if await _require_admin_message_strict(message, session) is None:
+            return
     data = await state.get_data()
     person_id = data.get("card_person_id")
     full_name = data.get("card_full_name")
@@ -5274,9 +5136,8 @@ async def fsm_admin_invite(message: Message, state: FSMContext) -> None:
     else:
         phone = text
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        admin = await _require_admin_message_strict(message, session)
+        if admin is None:
             await state.clear()
             return
         invite = await invite_admin(session, admin, username=username, phone=phone)
@@ -5291,9 +5152,7 @@ async def fsm_contact_name(message: Message, state: FSMContext) -> None:
     if not message.text or message.from_user is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
     await state.update_data(contact_name=message.text.strip())
@@ -5306,9 +5165,7 @@ async def fsm_contact_phone(message: Message, state: FSMContext) -> None:
     if not message.text or message.from_user is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
     await state.update_data(contact_phone=message.text.strip())
@@ -5326,9 +5183,7 @@ async def fsm_contact_edit_name(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         card = await session.get(ContactCard, contact_id)
@@ -5353,9 +5208,7 @@ async def fsm_contact_edit_phone(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         card = await session.get(ContactCard, contact_id)
@@ -5381,9 +5234,7 @@ async def fsm_contact_edit_role(message: Message, state: FSMContext) -> None:
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         card = await session.get(ContactCard, contact_id)
@@ -5412,9 +5263,7 @@ async def fsm_contact_role(message: Message, state: FSMContext) -> None:
         return
     data = await state.get_data()
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         card = ContactCard(
@@ -5433,9 +5282,7 @@ async def fsm_new_group(message: Message, state: FSMContext) -> None:
     if not message.text or message.from_user is None:
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         await state.update_data(pending_group_name=message.text.strip())
@@ -5448,9 +5295,7 @@ async def cb_new_group_stream(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     choice = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     data = await state.get_data()
     group_name = data.get("pending_group_name")
@@ -5480,9 +5325,7 @@ async def cb_new_group_stream(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin_group_stream")
 async def cb_admin_group_stream(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         groups = await _list_active_groups(session)
@@ -5507,9 +5350,7 @@ async def cb_pick_group_stream(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         group = await session.get(Group, group_id)
@@ -5533,9 +5374,7 @@ async def cb_set_group_stream(query: CallbackQuery, state: FSMContext) -> None:
     if len(parts) != 3:
         return
     _, group_id, choice = parts
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     if choice == "new":
         await state.set_state(GroupStreamFSM.new_stream_name)
@@ -5572,9 +5411,7 @@ async def fsm_new_group_stream_name(message: Message, state: FSMContext) -> None
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         stream = await create_stream(session, message.text.strip())
@@ -5597,9 +5434,7 @@ async def fsm_edit_group_stream_name(message: Message, state: FSMContext) -> Non
         await state.clear()
         return
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         stream = await create_stream(session, message.text.strip())
@@ -5654,9 +5489,7 @@ async def cb_weekday(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "admin_edit_week")
 async def cb_admin_edit_week(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
         pick_rows = await _weekly_slot_pick_rows(session)
@@ -5723,9 +5556,7 @@ async def cb_once_cancel(query: CallbackQuery, state: FSMContext) -> None:
         return
     on_date = parse_dmy(data["once_date"])
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, query.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await query.answer(REFUSAL, show_alert=True)
+        if await _require_admin_callback(query, session) is None:
             return
         slot = await session.get(WeeklySlot, data["slot_id"])
         school_session = await cancel_occurrence(session, data["slot_id"], on_date)
@@ -5808,9 +5639,7 @@ async def fsm_week_notes(message: Message, state: FSMContext) -> None:
     audience: list[Person] | None = None
     notice_text: str | None = None
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         if mode == "edit_one":
@@ -5877,9 +5706,7 @@ async def cb_sub_audience(query: CallbackQuery, state: FSMContext) -> None:
     audience = query.data.split(":", 1)[1]
     if audience not in ("person", "couple"):
         return
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
+    if await _require_admin_callback(query) is None:
         return
     await state.update_data(sub_audience=audience)
     await state.set_state(SubProductFSM.lessons)
@@ -5928,9 +5755,7 @@ async def fsm_sub_price(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     today = _today_local()
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         product = await create_product(
@@ -5968,9 +5793,7 @@ async def fsm_dropin_price(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     today = _today_local()
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         product = await create_product(session, "drop_in", data["drop_name"])
@@ -6006,9 +5829,7 @@ async def fsm_new_price_valid_from(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     amount = Decimal(data["price_amount"].replace(",", "."))
     async with async_session_maker() as session:
-        admin = await _person_by_telegram(session, message.from_user.id)
-        if admin is None or not _is_admin(admin):
-            await message.answer(REFUSAL)
+        if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
         await set_price(session, data["product_id"], amount, valid_from)
