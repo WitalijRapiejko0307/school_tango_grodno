@@ -5690,44 +5690,6 @@ async def cb_wedit(query: CallbackQuery, state: FSMContext) -> None:
         )
 
 
-@router.callback_query(F.data == "admin_edit_once")
-async def cb_admin_edit_once(query: CallbackQuery, state: FSMContext) -> None:
-    admin = await _person_for_callback(query)
-    if admin is None or not _is_admin(admin):
-        await query.answer(REFUSAL, show_alert=True)
-        return
-    async with async_session_maker() as session:
-        pick_rows = await _weekly_slot_pick_rows(session)
-    if not pick_rows:
-        await query.answer("Нет недельных слотов", show_alert=True)
-        return
-    await query.answer()
-    if query.message:
-        await query.message.answer(
-            "Какое повторяющееся занятие изменить на одну дату?"
-        )
-        await _start_list_pick(
-            query.message,
-            state,
-            purpose="slot_once",
-            rows=pick_rows,
-            title="Номер откроет этот слот.",
-            hint=HINT_INDEX,
-        )
-
-
-@router.callback_query(F.data.startswith("wonce:"))
-async def cb_wonce(query: CallbackQuery, state: FSMContext) -> None:
-    if query.data is None:
-        return
-    slot_id = query.data.split(":", 1)[1]
-    await state.update_data(mode="edit_one", slot_id=slot_id)
-    await state.set_state(WeekFSM.once_date)
-    await query.answer()
-    if query.message:
-        await query.message.answer("Дата занятия (ДД-ММ-ГГГГ):")
-
-
 @router.message(WeekFSM.once_date)
 async def fsm_once_date(message: Message, state: FSMContext) -> None:
     if not message.text:
