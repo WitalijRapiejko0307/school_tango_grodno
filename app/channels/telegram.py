@@ -3517,6 +3517,12 @@ def _group_card_keyboard(group_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="Перенести или отменить одно занятие",
+                    callback_data=f"grp_once:{group_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="Расписание",
                     callback_data=f"grp_sched:{group_id}",
                 ),
@@ -3679,8 +3685,42 @@ async def cb_grp_week(query: CallbackQuery, state: FSMContext) -> None:
         )
 
 
+@router.callback_query(F.data.startswith("grp_once:"))
+async def cb_grp_once(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    admin = await _person_for_callback(query)
+    if admin is None or not _is_admin(admin):
+        await query.answer(REFUSAL, show_alert=True)
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        pick_rows = await _weekly_slot_pick_rows(session, group_id=group_id)
+    if not pick_rows:
+        await query.answer("Нет недельных слотов", show_alert=True)
+        return
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Какое повторяющееся занятие изменить на одну дату?"
+        )
+        await _start_list_pick(
+            query.message,
+            state,
+            purpose="slot_once",
+            rows=pick_rows,
+            title="Номер откроет этот слот.",
+            hint=HINT_INDEX,
+        )
+
+
 @router.callback_query(F.data.startswith("grp_sched:"))
-async def cb_grp_schedule(query: CallbackQuery, state: FSMContext) -> None:
+async def cb_grp_schedule(query: CallbackQuery) -> None:
+    """Read-only view of the group's upcoming sessions (no actions)."""
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
@@ -3698,30 +3738,22 @@ async def cb_grp_schedule(query: CallbackQuery, state: FSMContext) -> None:
         await materialize_range(session, today, today + timedelta(days=21))
         upcoming = await upcoming_sessions(session, now, group_id=group_id)
         await session.commit()
-    if not upcoming:
-        await query.answer("Предстоящих занятий нет", show_alert=True)
-        return
-    pick_rows = [
-        PickRow(
-            id=school_session.id,
-            full_name=group_name,
-            detail=(
-                f"{format_school_datetime(school_session.starts_at)}, "
-                f"{school_session.place}"
-            ),
-        )
-        for school_session, group_name in upcoming
-    ]
+        gname = group.name
     await query.answer()
-    if query.message:
-        await _start_list_pick(
-            query.message,
-            state,
-            purpose="sess",
-            rows=pick_rows,
-            title="Номер откроет занятие: перенос или отмена.",
-            hint=HINT_INDEX,
+    if query.message is None:
+        return
+    if not upcoming:
+        await query.message.answer(
+            f"«{gname}»: предстоящих занятий на ближайшие 21 день нет."
         )
+        return
+    lines = [f"Расписание «{gname}» на ближайшие 21 день:"]
+    for school_session, _group_name in upcoming:
+        lines.append(
+            f"• {format_school_datetime(school_session.starts_at)}, "
+            f"{school_session.place}"
+        )
+    await query.message.answer("\n".join(lines))
 
 
 @router.callback_query(F.data.startswith("grp_ren:"))
