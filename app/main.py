@@ -13,6 +13,7 @@ from app.channels.tracking_bot import TrackingBot
 from app.channels.telegram import router as telegram_router, send_due_reminder
 from app.config import get_settings
 from app.db import Base, async_session_maker, engine
+from app.services.gather import process_due_gathers
 from app.services.notifications import mark_sent, plan_due
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,18 @@ async def _reminder_loop(bot: Bot) -> None:
                 await session.commit()
         except Exception:
             logger.exception("Reminder loop iteration failed")
+        await asyncio.sleep(60)
+
+
+async def _gather_loop(bot: Bot) -> None:
+    while True:
+        try:
+            async with async_session_maker() as session:
+                now = datetime.now(UTC)
+                await process_due_gathers(session, bot, now)
+                await session.commit()
+        except Exception:
+            logger.exception("Gather loop iteration failed")
         await asyncio.sleep(60)
 
 
@@ -184,7 +197,8 @@ async def lifespan(app: FastAPI):
             )
 
     bot: Bot | None = None
-    task: asyncio.Task | None = None
+    reminder_task: asyncio.Task | None = None
+    gather_task: asyncio.Task | None = None
     if settings.BOT_TOKEN:
         bot = TrackingBot(token=settings.BOT_TOKEN)
         if settings.PUBLIC_URL.strip():
@@ -192,19 +206,21 @@ async def lifespan(app: FastAPI):
                 await _register_telegram_webhook(bot, settings)
             except Exception:
                 logger.exception("Failed to register Telegram webhook")
-        task = asyncio.create_task(_reminder_loop(bot))
+        reminder_task = asyncio.create_task(_reminder_loop(bot))
+        gather_task = asyncio.create_task(_gather_loop(bot))
 
     app.state.bot = bot
     app.state.dispatcher = _dispatcher
 
     yield
 
-    if task is not None:
-        task.cancel()
-        try:
-            await task
-        except asyncio.CancelledError:
-            pass
+    for task in (reminder_task, gather_task):
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
     if bot is not None:
         await bot.session.close()
 

@@ -1,12 +1,15 @@
 """Billing application services (products, prices, subscriptions)."""
 
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
+from typing import Literal
 
 from sqlalchemy import or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Price, Product, Subscription
+from app.models import Payment, Price, Product, Subscription
+
+PaymentStatus = Literal["paid", "unpaid", "unknown"]
 
 _VALID_AUDIENCES = frozenset({"person", "couple"})
 
@@ -17,9 +20,12 @@ def _validate_audience(audience: str) -> None:
 
 
 async def _has_active_couple_subscription(
-    session: AsyncSession, person_id: str, on_date: date
+    session: AsyncSession,
+    person_id: str,
+    on_date: date,
+    exclude_subscription_id: str | None = None,
 ) -> bool:
-    result = await session.execute(
+    query = (
         select(Subscription.id)
         .where(
             Subscription.partner_id.isnot(None),
@@ -33,6 +39,9 @@ async def _has_active_couple_subscription(
         )
         .limit(1)
     )
+    if exclude_subscription_id is not None:
+        query = query.where(Subscription.id != exclude_subscription_id)
+    result = await session.execute(query)
     return result.scalar_one_or_none() is not None
 
 
@@ -95,12 +104,95 @@ async def current_price(
     return result.scalar_one_or_none()
 
 
+def subscription_payment_status(sub: Subscription) -> PaymentStatus:
+    if sub.amount_due is None:
+        return "unknown"
+    if sub.amount_paid >= sub.amount_due:
+        return "paid"
+    return "unpaid"
+
+
+async def record_payment(
+    session: AsyncSession,
+    subscription_id: str,
+    amount: Decimal,
+    paid_on: date,
+    recorded_by_id: str | None = None,
+) -> Payment:
+    if amount <= 0:
+        raise ValueError("payment amount must be positive")
+    result = await session.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )
+    sub = result.scalar_one()
+    payment = Payment(
+        subscription_id=subscription_id,
+        amount=amount,
+        paid_on=paid_on,
+        recorded_by_id=recorded_by_id,
+    )
+    session.add(payment)
+    sub.amount_paid = sub.amount_paid + amount
+    await session.flush()
+    return payment
+
+
+async def person_has_unpaid_started(
+    session: AsyncSession, person_id: str, today: date
+) -> bool:
+    result = await session.execute(
+        select(Subscription).where(
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            ),
+        )
+    )
+    for sub in result.scalars().all():
+        if subscription_payment_status(sub) != "unpaid":
+            continue
+        if sub.starts_on is not None and sub.starts_on > today:
+            continue
+        return True
+    return False
+
+
+async def replace_partner(
+    session: AsyncSession, subscription_id: str, new_partner_id: str
+) -> Subscription:
+    result = await session.execute(
+        select(Subscription).where(Subscription.id == subscription_id)
+    )
+    sub = result.scalar_one()
+    product = await _get_product(session, sub.product_id)
+    if product.audience != "couple":
+        raise ValueError("subscription product is not for couples")
+    if new_partner_id == sub.person_id:
+        raise ValueError("partner must differ from the primary person")
+    today = date.today()
+    if await _has_active_couple_subscription(
+        session,
+        new_partner_id,
+        today,
+        exclude_subscription_id=subscription_id,
+    ):
+        raise ValueError("person already has an active couple subscription")
+    sub.partner_id = new_partner_id
+    await session.flush()
+    return sub
+
+
 async def open_subscription(
     session: AsyncSession,
     person_id: str,
     product_id: str,
     started_on: date,
     partner_id: str | None = None,
+    *,
+    starts_on: date | None = None,
+    amount_due: Decimal | None = None,
+    amount_paid: Decimal = Decimal("0"),
+    recorded_by_id: str | None = None,
 ) -> Subscription:
     result = await session.execute(
         select(Product).where(Product.id == product_id)
@@ -127,16 +219,64 @@ async def open_subscription(
     else:
         raise ValueError(f"unknown product audience: {product.audience}")
 
+    valid_until: date | None = None
+    if starts_on is not None and product.validity_days is not None:
+        valid_until = starts_on + timedelta(days=product.validity_days)
+
+    paid = amount_paid
+    if paid < 0:
+        raise ValueError("amount_paid must not be negative")
+
     subscription = Subscription(
         person_id=person_id,
         partner_id=partner_id,
         product_id=product_id,
         lessons_left=product.lessons_count,
-        valid_until=None,
+        valid_until=valid_until,
+        starts_on=starts_on,
+        amount_due=amount_due,
+        amount_paid=paid,
     )
     session.add(subscription)
     await session.flush()
+
+    if paid > 0:
+        payment = Payment(
+            subscription_id=subscription.id,
+            amount=paid,
+            paid_on=starts_on if starts_on is not None else started_on,
+            recorded_by_id=recorded_by_id,
+        )
+        session.add(payment)
+        await session.flush()
+
     return subscription
+
+
+async def issue_subscription(
+    session: AsyncSession,
+    person_id: str,
+    product_id: str,
+    started_on: date,
+    partner_id: str | None = None,
+    *,
+    starts_on: date | None = None,
+    amount_due: Decimal | None = None,
+    amount_paid: Decimal = Decimal("0"),
+    recorded_by_id: str | None = None,
+) -> Subscription:
+    """Alias for open_subscription with billing fields."""
+    return await open_subscription(
+        session,
+        person_id,
+        product_id,
+        started_on,
+        partner_id,
+        starts_on=starts_on,
+        amount_due=amount_due,
+        amount_paid=amount_paid,
+        recorded_by_id=recorded_by_id,
+    )
 
 
 async def active_subscription(

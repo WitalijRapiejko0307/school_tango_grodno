@@ -68,6 +68,9 @@ class DropInProductFSM(StatesGroup):
 class OpenSubFSM(StatesGroup):
     person_id = State()
     product_id = State()
+    starts_on = State()
+    payment = State()
+    partial_amount = State()
 
 
 class NewPriceFSM(StatesGroup):

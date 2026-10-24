@@ -44,6 +44,7 @@ from app.services.pick_list import (
     attendance_report,
     short_report,
 )
+from app.services.billing import person_has_unpaid_started
 from app.services.roster import (
     RosterDraftItem,
     confirm_roster,
@@ -124,8 +125,8 @@ from .people import (  # noqa: E402
     _format_contacts,
     _list_non_admin_pick_rows,
     _prompt_leave_person,
-    _send_person_card,
     _start_people_pick,
+    send_person_card,
 )
 
 async def _list_today_sessions(session: AsyncSession, day: date) -> list[SchoolSession]:
@@ -174,6 +175,74 @@ async def _list_archived_groups(session: AsyncSession) -> list[Group]:
                 .order_by(Group.name)
             )
         ).scalars().all()
+    )
+
+
+_WEEKDAY_FULL_RU = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+
+
+def _format_user_session_datetime(dt: datetime) -> str:
+    tz = _school_tz()
+    if dt.tzinfo is None:
+        local = dt.replace(tzinfo=tz)
+    else:
+        local = dt.astimezone(tz)
+    weekday = _WEEKDAY_FULL_RU[local.weekday()]
+    return f"{weekday}, {format_school_datetime(dt)}"
+
+
+def _format_user_session_date(d: date) -> str:
+    return f"{_WEEKDAY_FULL_RU[d.weekday()]}, {format_school_date(d)}"
+
+
+def _roster_role_label(person: Person, has_active_membership: bool) -> str:
+    if person.role == "guest":
+        return "гость"
+    if person.role == "client":
+        return "клиент"
+    if person.role == "admin":
+        if has_active_membership:
+            return "админ, клиент"
+        return "админ"
+    return person.role
+
+
+async def _format_roster_member_line(
+    session: AsyncSession,
+    index: int,
+    person: Person,
+    today: date,
+) -> str:
+    membership = await _active_membership(session, person.id)
+    role = _roster_role_label(person, membership is not None)
+    line = f"{index}. {person.full_name} — {role}"
+    if await person_has_unpaid_started(session, person.id, today):
+        line += " — не оплачен"
+    return line
+
+
+def _grp_roster_keyboard(group_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Добавить",
+                    callback_data=f"grp_roster_add:{group_id}",
+                ),
+                InlineKeyboardButton(
+                    text="Просмотр",
+                    callback_data=f"grp_roster_view:{group_id}",
+                ),
+            ],
+        ]
     )
 
 
@@ -264,7 +333,7 @@ async def _build_rows_school_sessions(
             continue
         gname = await _session_group_name(session, school_session.group_id)
         detail = (
-            f"{format_school_datetime(school_session.starts_at)}, "
+            f"{_format_user_session_datetime(school_session.starts_at)}, "
             f"{school_session.place}"
         )
         rows.append(PickRow(id=school_session.id, full_name=gname, detail=detail))
@@ -567,7 +636,7 @@ async def _after_people_pick(
         return
     if purpose == "view":
         await state.clear()
-        await _send_person_card(message, person_id)
+        await send_person_card(message, person_id)
         return
     if purpose == "leave":
         await _prompt_leave_person(message, state, person_id)
@@ -675,7 +744,7 @@ async def _finish_assign_group_message(
             next_line: str | None = None
             if nxt is not None:
                 next_line = (
-                    f"Ближайшее занятие: {format_school_datetime(nxt.starts_at)}, "
+                    f"Ближайшее занятие: {_format_user_session_datetime(nxt.starts_at)}, "
                     f"{nxt.place}"
                 )
             transfer_notify = (
@@ -755,7 +824,13 @@ async def _apply_assign_group_choice(
 
 async def _begin_roster_group_state(state: FSMContext, group_id: str) -> None:
     await state.set_state(RosterFSM.active)
-    await state.update_data(group_id=group_id, drafts=[])
+    await state.update_data(
+        group_id=group_id,
+        drafts=[],
+        roster_mode=None,
+        roster_view_ids=None,
+        roster_view_group=None,
+    )
 
 
 async def _begin_roster_group(
@@ -809,7 +884,7 @@ async def _finish_assign_group(
             next_line: str | None = None
             if nxt is not None:
                 next_line = (
-                    f"Ближайшее занятие: {format_school_datetime(nxt.starts_at)}, "
+                    f"Ближайшее занятие: {_format_user_session_datetime(nxt.starts_at)}, "
                     f"{nxt.place}"
                 )
             transfer_notify = (
@@ -1259,22 +1334,65 @@ async def cb_grp_roster(query: CallbackQuery, state: FSMContext) -> None:
             return
         name = group.name
         members = await group_audience(session, group_id)
+        today = _today_local()
+        member_lines: list[str] = []
+        for index, person in enumerate(members, start=1):
+            member_lines.append(
+                await _format_roster_member_line(session, index, person, today)
+            )
+    await state.clear()
     await query.answer()
     if query.message is None:
         return
-    if members:
-        lines = [f"Состав группы «{name}»:"] + [
-            f"{i}. {p.full_name}" for i, p in enumerate(members, start=1)
-        ]
+    if member_lines:
+        lines = [f"Состав группы «{name}»:"] + member_lines
     else:
         lines = [f"Состав группы «{name}»: пока никого нет."]
-    lines.append("")
-    lines.append(
-        "Пришлите строки состава (по одному человеку на строку) или фото списка, "
-        "чтобы добавить."
+    await query.message.answer("\n".join(lines), reply_markup=_grp_roster_keyboard(group_id))
+
+
+@router.callback_query(F.data.startswith("grp_roster_add:"))
+async def cb_grp_roster_add(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+    await query.answer()
+    if query.message:
+        await _begin_roster_group(query.message, state, group_id)
+
+
+@router.callback_query(F.data.startswith("grp_roster_view:"))
+async def cb_grp_roster_view(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        members = await group_audience(session, group_id)
+    view_ids = [p.id for p in members]
+    await state.set_state(RosterFSM.active)
+    await state.update_data(
+        roster_mode="view",
+        roster_view_ids=view_ids,
+        roster_view_group=group_id,
+        group_id=group_id,
+        drafts=[],
     )
-    await query.message.answer("\n".join(lines))
-    await _begin_roster_group_state(state, group_id)
+    await query.answer()
+    if query.message:
+        await query.message.answer("Номер откроет карточку.")
 
 
 @router.callback_query(F.data.startswith("grp_stream:"))
@@ -1411,7 +1529,7 @@ async def cb_grp_schedule(query: CallbackQuery) -> None:
     lines = [f"Расписание «{gname}» на ближайшие 21 день:"]
     for school_session, _group_name in upcoming:
         lines.append(
-            f"• {format_school_datetime(school_session.starts_at)}, "
+            f"• {_format_user_session_datetime(school_session.starts_at)}, "
             f"{school_session.place}"
         )
     await query.message.answer("\n".join(lines))
@@ -1781,6 +1899,9 @@ async def _apply_roster_image(
     message: Message, state: FSMContext, image_bytes: bytes, mime: str
 ) -> None:
     data = await state.get_data()
+    if data.get("roster_mode") == "view":
+        await message.answer("Сейчас ожидается номер из списка состава.")
+        return
     if not data.get("group_id"):
         await message.answer("Сначала выберите или создайте группу.")
         return
@@ -1839,6 +1960,20 @@ async def fsm_roster_text(message: Message, state: FSMContext) -> None:
             return
 
     data = await state.get_data()
+    if data.get("roster_mode") == "view":
+        view_ids = list(data.get("roster_view_ids") or [])
+        if not text.isdigit():
+            await message.answer("Введите номер из списка.")
+            return
+        index = int(text)
+        if not 1 <= index <= len(view_ids):
+            await message.answer("Нет такого номера.")
+            return
+        person_id = view_ids[index - 1]
+        await state.clear()
+        await send_person_card(message, person_id)
+        return
+
     group_id = data.get("group_id")
     drafts: list[dict[str, object]] = list(data.get("drafts") or [])
 
@@ -1936,7 +2071,7 @@ async def menu_my_group(message: Message) -> None:
         nxt = next_result.scalar_one_or_none()
         if nxt:
             await message.answer(
-                f"Группа: {gname}\nБлижайшее: {format_school_datetime(nxt.starts_at)}, {nxt.place}"
+                f"Группа: {gname}\nБлижайшее: {_format_user_session_datetime(nxt.starts_at)}, {nxt.place}"
             )
         else:
             await message.answer(f"Группа: {gname}\nБлижайших занятий нет.")
@@ -1979,7 +2114,7 @@ async def menu_schedule(message: Message, state: FSMContext) -> None:
         choices: dict[str, str] = {}
         for index, school_session in enumerate(sessions, start=1):
             gname = await _session_group_name(session, school_session.group_id)
-            local_t = format_school_datetime(school_session.starts_at)
+            local_t = _format_user_session_datetime(school_session.starts_at)
             lines.append(f"{index}. {local_t} — {gname}, {school_session.place}")
             choices[str(index)] = school_session.id
         await state.set_state(GuestPickFSM.number)
@@ -2248,7 +2383,9 @@ async def fsm_once_date(message: Message, state: FSMContext) -> None:
             [InlineKeyboardButton(text="Отменить занятие", callback_data="once_cancel")],
         ]
     )
-    await message.answer(f"Занятие {format_school_date(on_date)}:", reply_markup=kb)
+    await message.answer(
+        f"Занятие {_format_user_session_date(on_date)}:", reply_markup=kb
+    )
 
 
 @router.callback_query(F.data == "once_cancel")

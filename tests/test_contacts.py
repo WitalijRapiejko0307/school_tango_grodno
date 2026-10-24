@@ -5,8 +5,11 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.db import Base
 from app.models import ContactCard
+from app.models import Person
 from app.services.contacts import (
     archive_contact,
+    contact_for_person,
+    create_contact,
     list_contacts,
     restore_contact,
     update_contact,
@@ -46,6 +49,26 @@ async def test_update_contact_rejects_empty_fields(db_session: AsyncSession) -> 
 
     with pytest.raises(ValueError, match="required"):
         await update_contact(db_session, card.id, "   ", "123", "DJ")
+
+
+async def test_create_contact_with_person_id(db_session: AsyncSession) -> None:
+    person = Person(full_name="Admin", role="admin")
+    db_session.add(person)
+    await db_session.flush()
+
+    card = await create_contact(
+        db_session, "Admin", "+375", "Директор", person_id=person.id
+    )
+    assert card.person_id == person.id
+
+    found = await contact_for_person(db_session, person.id)
+    assert found is not None
+    assert found.id == card.id
+
+    updated = await update_contact(
+        db_session, card.id, "Admin", "123", "Boss", person_id=person.id
+    )
+    assert updated.person_id == person.id
 
 
 async def test_archive_restore_and_list_contacts(db_session: AsyncSession) -> None:

@@ -4,6 +4,7 @@ from .billing import router as _billing_router
 from .notices import router as _notices_router
 from .people import router as _people_router
 from .groups import router as _groups_router
+from .gather import router as _gather_router
 from .core import router as _core_router
 
 router = Router(name="telegram")
@@ -11,6 +12,7 @@ router.include_router(_billing_router)
 router.include_router(_notices_router)
 router.include_router(_people_router)
 router.include_router(_groups_router)
+router.include_router(_gather_router)
 router.include_router(_core_router)
 
 # Re-exports kept for external callers (app/main.py, tests/).

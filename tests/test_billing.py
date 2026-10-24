@@ -14,8 +14,12 @@ from app.services.billing import (
     deactivate_product,
     list_active_products_with_prices,
     open_subscription,
+    person_has_unpaid_started,
+    record_payment,
+    replace_partner,
     restore_product,
     set_price,
+    subscription_payment_status,
     update_product,
 )
 
@@ -336,3 +340,168 @@ async def test_second_active_couple_subscription_raises(
             started_on=date(2026, 5, 2),
             partner_id=new_partner,
         )
+
+
+async def test_partial_payment_is_unpaid(db_session: AsyncSession) -> None:
+    person = Person(full_name="Client", role="client")
+    db_session.add(person)
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=60,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 1, 1),
+        starts_on=date(2026, 1, 1),
+        amount_due=Decimal("100.00"),
+        amount_paid=Decimal("40.00"),
+    )
+    assert subscription_payment_status(sub) == "unpaid"
+    assert sub.amount_paid == Decimal("40.00")
+
+
+async def test_full_payment_is_paid(db_session: AsyncSession) -> None:
+    person = Person(full_name="Client", role="client")
+    db_session.add(person)
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=60,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 1, 1),
+        starts_on=date(2026, 1, 1),
+        amount_due=Decimal("100.00"),
+        amount_paid=Decimal("100.00"),
+    )
+    assert subscription_payment_status(sub) == "paid"
+
+    await record_payment(
+        db_session, sub.id, Decimal("10.00"), date(2026, 1, 15)
+    )
+    await db_session.refresh(sub)
+    assert subscription_payment_status(sub) == "paid"
+    assert sub.amount_paid == Decimal("110.00")
+
+
+async def test_future_starts_on_not_counted_as_started_unpaid(
+    db_session: AsyncSession,
+) -> None:
+    person = Person(full_name="Client", role="client")
+    db_session.add(person)
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=60,
+    )
+    await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 6, 1),
+        starts_on=date(2026, 6, 15),
+        amount_due=Decimal("50.00"),
+        amount_paid=Decimal("0"),
+    )
+    assert not await person_has_unpaid_started(
+        db_session, person.id, date(2026, 6, 10)
+    )
+    assert await person_has_unpaid_started(
+        db_session, person.id, date(2026, 6, 15)
+    )
+
+
+async def test_legacy_amount_due_none_not_unpaid(
+    db_session: AsyncSession,
+) -> None:
+    person = Person(full_name="Client", role="client")
+    db_session.add(person)
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=60,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 1, 1),
+    )
+    assert subscription_payment_status(sub) == "unknown"
+    assert not await person_has_unpaid_started(
+        db_session, person.id, date(2026, 6, 1)
+    )
+
+
+async def test_replace_partner_success(db_session: AsyncSession) -> None:
+    primary = Person(full_name="Primary", role="client")
+    old_partner = Person(full_name="Old", role="client")
+    new_partner = Person(full_name="New", role="client")
+    db_session.add_all([primary, old_partner, new_partner])
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple",
+        lessons_count=8,
+        validity_days=60,
+        audience="couple",
+    )
+    sub = await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=date(2026, 3, 1),
+        partner_id=old_partner.id,
+    )
+    updated = await replace_partner(db_session, sub.id, new_partner.id)
+    assert updated.person_id == primary.id
+    assert updated.partner_id == new_partner.id
+
+
+async def test_replace_partner_self_raises(db_session: AsyncSession) -> None:
+    primary = Person(full_name="Primary", role="client")
+    partner = Person(full_name="Partner", role="client")
+    db_session.add_all([primary, partner])
+    await db_session.flush()
+
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Couple",
+        lessons_count=8,
+        validity_days=60,
+        audience="couple",
+    )
+    sub = await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=date(2026, 3, 1),
+        partner_id=partner.id,
+    )
+    with pytest.raises(ValueError, match="partner must differ"):
+        await replace_partner(db_session, sub.id, primary.id)

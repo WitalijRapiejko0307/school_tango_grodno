@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
@@ -14,13 +14,16 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from sqlalchemy import select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from .states import EnrollFSM, ListPickFSM
 from app.db import async_session_maker
-from app.models import Person, SchoolSession
-from app.services.billing import active_subscription
+from app.models import Attendance, Person, Product, SchoolSession, Subscription
+from app.services.billing import (
+    person_has_unpaid_started,
+    subscription_payment_status,
+)
 from app.services.identity import (
     has_pending_phone_invite,
     upsert_from_telegram,
@@ -38,7 +41,12 @@ from app.services.notifications import (
     record_not_coming,
     second_booking_prompt_text,
 )
-from app.services.school_time import format_school_date, format_school_datetime
+from app.services.school_time import (
+    format_school_date,
+    format_school_datetime,
+    format_school_time,
+    school_tz,
+)
 from app.services.roster import (
     admin_contacts,
     claim_person,
@@ -51,7 +59,7 @@ from app.services.pick_list import (
     page_text,
     resolve_picks,
 )
-from app.services.schedule import materialize_range
+from app.services.schedule import active_group_membership, materialize_range
 
 logger = logging.getLogger(__name__)
 
@@ -63,8 +71,8 @@ from .people import (  # noqa: E402
 )
 from .common import (  # noqa: E402
     ARCHIVED_ACCESS_CLOSED,
-    BTN_BALANCE,
-    BTN_OTHER_GROUP,
+    BTN_CLIENT_CLASSES,
+    BTN_CLIENT_SUBS,
     BTN_TODAY,
     REFUSAL,
     _BlockArchivedMiddleware,
@@ -106,6 +114,155 @@ router.callback_query.middleware(_BlockArchivedMiddleware())
 
 
 
+_WEEKDAY_FULL_RU = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+_UNPAID_SUBSCRIPTION_NOTE = (
+    "Есть неоплаченный абонемент — его можно закрыть у администратора."
+)
+_CLIENT_SUBS_PAGE = 3
+
+
+def _format_class_date(day: date) -> str:
+    return f"{_WEEKDAY_FULL_RU[day.weekday()]}, {format_school_date(day)}"
+
+
+def _session_calendar_day(school_session: SchoolSession) -> date:
+    if school_session.session_date is not None:
+        return school_session.session_date
+    starts = school_session.starts_at
+    if starts.tzinfo is None:
+        return starts.replace(tzinfo=school_tz()).date()
+    return starts.astimezone(school_tz()).date()
+
+
+def _format_class_session_line(school_session: SchoolSession) -> str:
+    day = _session_calendar_day(school_session)
+    return (
+        f"{_format_class_date(day)}, "
+        f"{format_school_time(school_session.starts_at)}, "
+        f"{school_session.place}"
+    )
+
+
+def _subscription_period_label(sub: Subscription) -> str:
+    if sub.starts_on is None:
+        if sub.valid_until is not None:
+            return f"с первого визита — {format_school_date(sub.valid_until)}"
+        return "с первого визита"
+    start = format_school_date(sub.starts_on)
+    if sub.valid_until is not None:
+        return f"{start}–{format_school_date(sub.valid_until)}"
+    return start
+
+
+def _subscription_is_inactive(sub: Subscription, today: date) -> bool:
+    if sub.lessons_left == 0:
+        return True
+    if sub.valid_until is not None and sub.valid_until < today:
+        return True
+    if sub.starts_on is not None and sub.starts_on > today:
+        return True
+    return False
+
+
+def _subscription_covers_day(sub: Subscription, day: date) -> bool:
+    if sub.starts_on is not None and day < sub.starts_on:
+        return False
+    if sub.valid_until is not None and day > sub.valid_until:
+        return False
+    return True
+
+
+async def _person_subscriptions(
+    session: AsyncSession, person_id: str
+) -> list[Subscription]:
+    result = await session.execute(
+        select(Subscription)
+        .where(
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            )
+        )
+        .order_by(desc(Subscription.created_at))
+    )
+    return list(result.scalars().all())
+
+
+async def _visit_lines_for_subscription(
+    session: AsyncSession, person_id: str, sub: Subscription
+) -> list[str]:
+    result = await session.execute(
+        select(SchoolSession)
+        .join(Attendance, Attendance.session_id == SchoolSession.id)
+        .where(Attendance.person_id == person_id)
+        .order_by(SchoolSession.starts_at)
+    )
+    lines: list[str] = []
+    for school_session in result.scalars().all():
+        day = _session_calendar_day(school_session)
+        if _subscription_covers_day(sub, day):
+            lines.append(_format_class_date(day))
+    return lines
+
+
+async def _format_client_subscription_block(
+    session: AsyncSession,
+    person_id: str,
+    sub: Subscription,
+    product: Product | None,
+    today: date,
+) -> str:
+    name = product.name if product is not None else "—"
+    status = "неактивен" if _subscription_is_inactive(sub, today) else "активен"
+    period = _subscription_period_label(sub)
+    header = f"{name}\n{status}; осталось {sub.lessons_left}; {period}"
+    if subscription_payment_status(sub) == "unpaid":
+        header += "\nне оплачен"
+    visits = await _visit_lines_for_subscription(session, person_id, sub)
+    if visits:
+        header += "\n" + "\n".join(visits)
+    return header
+
+
+async def _client_subscriptions_text(
+    session: AsyncSession,
+    person_id: str,
+    *,
+    offset: int = 0,
+    limit: int | None = _CLIENT_SUBS_PAGE,
+) -> str:
+    subs = await _person_subscriptions(session, person_id)
+    if not subs:
+        return "Абонементов пока нет."
+    today = _today_local()
+    slice_end = len(subs) if limit is None else min(len(subs), offset + limit)
+    blocks: list[str] = []
+    for sub in subs[offset:slice_end]:
+        product = await session.get(Product, sub.product_id)
+        blocks.append(
+            await _format_client_subscription_block(
+                session, person_id, sub, product, today
+            )
+        )
+    return "\n\n".join(blocks)
+
+
+async def _append_unpaid_note_if_needed(
+    session: AsyncSession, person_id: str, text: str
+) -> str:
+    if await person_has_unpaid_started(session, person_id, _today_local()):
+        return f"{text}\n{_UNPAID_SUBSCRIPTION_NOTE}"
+    return text
+
+
 async def _group_and_next_session_message(
     session: AsyncSession, person_id: str
 ) -> str:
@@ -132,7 +289,7 @@ async def _group_and_next_session_message(
     if nxt:
         return (
             f"Вы в «{gname}».\n"
-            f"Ближайшее: {format_school_datetime(nxt.starts_at)}, {nxt.place}"
+            f"Ближайшее: {_format_class_session_line(nxt)}"
         )
     return f"Вы в «{gname}». Ближайших занятий пока нет."
 
@@ -400,10 +557,13 @@ async def cb_go(query: CallbackQuery) -> None:
             await query.answer("Сначала нажмите /start")
             return
         await record_coming(session, person.id, session_id, datetime.now(UTC))
+        reply = await _append_unpaid_note_if_needed(
+            session, person.id, "записали, что идёте"
+        )
         await session.commit()
     await query.answer()
     if query.message:
-        await query.message.answer("записали, что идёте")
+        await query.message.answer(reply)
 
 
 @router.callback_query(F.data.startswith("nogo:"))
@@ -417,10 +577,13 @@ async def cb_not_go(query: CallbackQuery) -> None:
             await query.answer("Сначала нажмите /start")
             return
         await record_not_coming(session, person.id, session_id, datetime.now(UTC))
+        reply = await _append_unpaid_note_if_needed(
+            session, person.id, "приняли, что не идёте"
+        )
         await session.commit()
     await query.answer()
     if query.message:
-        await query.message.answer("приняли, что не идёте")
+        await query.message.answer(reply)
 
 
 @router.callback_query(F.data.startswith("att:"))
@@ -443,6 +606,7 @@ async def cb_attendance(query: CallbackQuery) -> None:
             )
         except ValueError:
             text = "Занятие не списываем." if not yes else "Нет активного вопроса."
+        text = await _append_unpaid_note_if_needed(session, person.id, text)
         await session.commit()
     await query.answer()
     if query.message:
@@ -706,63 +870,89 @@ async def menu_today(message: Message, state: FSMContext) -> None:
 
 
 
-@router.message(F.text == BTN_BALANCE)
-async def menu_balance(message: Message) -> None:
+@router.message(F.text == BTN_CLIENT_SUBS)
+async def menu_client_subscriptions(message: Message) -> None:
+    if message.from_user is None:
+        return
     async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
+        person = await _person_by_telegram(session, message.from_user.id)
         if person is None or person.role != "client":
             return
-        today = _today_local()
-        sub = await active_subscription(session, person.id, today)
-        if sub is None:
-            await message.answer("нет абонемента")
-        else:
-            await message.answer(
-                (
-                    f"Осталось занятий: {sub.lessons_left}. "
-                    + (
-                        f"Действует до {format_school_date(sub.valid_until)}."
-                        if sub.valid_until is not None
-                        else "Срок начнётся с первого посещения."
-                    )
-                )
-            )
-
-
-@router.message(F.text == BTN_OTHER_GROUP)
-async def menu_other_group(message: Message) -> None:
-    from .groups import _list_today_sessions, _session_group_name
-
-    async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)  # type: ignore[union-attr]
-        if person is None or person.role != "client":
-            return
-        membership = await _active_membership(session, person.id)
-        my_group_id = membership.group_id if membership else None
-        today = _today_local()
-        sessions = await _list_today_sessions(session, today)
-        await session.commit()
-        sessions = [s for s in sessions if s.group_id != my_group_id]
-        if not sessions:
-            await message.answer("Сегодня нет других занятий.")
-            return
-        buttons = []
-        for s in sessions:
-            gname = await _session_group_name(session, s.group_id)
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text=f"{gname} {format_school_datetime(s.starts_at)}",
-                        callback_data=f"other_sess:{s.id}",
-                    )
+        subs = await _person_subscriptions(session, person.id)
+        text = await _client_subscriptions_text(session, person.id)
+        markup = None
+        if len(subs) > _CLIENT_SUBS_PAGE:
+            markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Показать ещё",
+                            callback_data=f"client_subs_more:{person.id}",
+                        )
+                    ]
                 ]
             )
-        await message.answer(
-            "Выберите занятие:",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons),
+        await session.commit()
+    await message.answer(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("client_subs_more:"))
+async def cb_client_subs_more(query: CallbackQuery) -> None:
+    if query.data is None or query.from_user is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, query.from_user.id)
+        if person is None or person.id != person_id or person.role != "client":
+            await query.answer("Недоступно", show_alert=True)
+            return
+        text = await _client_subscriptions_text(
+            session, person.id, offset=_CLIENT_SUBS_PAGE, limit=None
         )
+        await session.commit()
+    await query.answer()
+    if query.message:
+        await query.message.answer(text)
 
 
+@router.message(F.text == BTN_CLIENT_CLASSES)
+async def menu_client_classes(message: Message) -> None:
+    if message.from_user is None:
+        return
+    async with async_session_maker() as session:
+        person = await _person_by_telegram(session, message.from_user.id)
+        if person is None or person.role != "client":
+            return
+        membership = await active_group_membership(session, person.id)
+        if membership is None:
+            await session.commit()
+            await message.answer("Вы не в группе.")
+            return
+        today = _today_local()
+        end = today + timedelta(days=7)
+        await materialize_range(session, today, end)
+        tz = school_tz()
+        range_start = datetime(today.year, today.month, today.day, tzinfo=tz)
+        range_end = datetime(end.year, end.month, end.day, tzinfo=tz)
+        start_utc = range_start.astimezone(UTC)
+        end_utc = range_end.astimezone(UTC)
+        result = await session.execute(
+            select(SchoolSession)
+            .where(
+                SchoolSession.group_id == membership.group_id,
+                SchoolSession.starts_at >= start_utc,
+                SchoolSession.starts_at < end_utc,
+                SchoolSession.status == "scheduled",
+            )
+            .order_by(SchoolSession.starts_at)
+        )
+        sessions = list(result.scalars().all())
+        await session.commit()
+    if not sessions:
+        await message.answer("На ближайшую неделю занятий нет.")
+        return
+    lines = [_format_class_session_line(s) for s in sessions]
+    await message.answer("\n".join(lines))
 
 
 

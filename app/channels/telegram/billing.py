@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from datetime import date
+from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
@@ -61,6 +61,65 @@ router.message.middleware(_TrackUserMessageMiddleware())
 router.message.middleware(_BlockArchivedMiddleware())
 router.callback_query.middleware(_BlockArchivedMiddleware())
 
+_OPEN_SUB_CANCEL = "отмена"
+_PROMPT_START_DATE = "Дата начала абонемента (ДД.ММ.ГГГГ):"
+_PROMPT_PAYMENT = "Оплата: да / частично / нет"
+_PROMPT_PARTIAL_AMOUNT = "Сумма оплаты (число, запятая или точка):"
+
+
+def parse_open_sub_start_date(text: str) -> date:
+    return datetime.strptime(text.strip(), "%d.%m.%Y").date()
+
+
+def parse_open_sub_payment_choice(text: str) -> str | None:
+    lowered = text.strip().lower()
+    if lowered == "да":
+        return "yes"
+    if lowered == "нет":
+        return "no"
+    if lowered == "частично":
+        return "partial"
+    return None
+
+
+def parse_open_sub_amount(text: str) -> Decimal:
+    return Decimal(text.strip().replace(",", "."))
+
+
+def partial_amount_error(amount: Decimal, amount_due: Decimal | None) -> str | None:
+    if amount <= 0:
+        return "Сумма должна быть больше нуля."
+    if amount_due is not None and amount >= amount_due:
+        return "Сумма должна быть меньше полной цены."
+    return None
+
+
+def amount_paid_for_open_sub(
+    choice: str, amount_due: Decimal | None, partial: Decimal | None = None
+) -> Decimal:
+    if choice == "no":
+        return Decimal("0")
+    if choice == "yes":
+        return amount_due if amount_due is not None else Decimal("0")
+    if partial is None:
+        raise ValueError("partial amount required")
+    return partial
+
+
+def _amount_due_from_fsm_data(data: dict[str, object]) -> Decimal | None:
+    raw = data.get("amount_due")
+    if raw is None:
+        return None
+    return Decimal(str(raw))
+
+
+async def _clear_open_sub_cancel(message: Message, state: FSMContext) -> bool:
+    if message.text and message.text.strip().lower() == _OPEN_SUB_CANCEL:
+        await state.clear()
+        await message.answer("Выдача абонемента отменена.")
+        return True
+    return False
+
 
 async def _build_rows_prd(
     session: AsyncSession, data: dict[str, object]
@@ -109,7 +168,27 @@ async def _report_open_subscription(
     product_id: str,
     partner_id: str | None = None,
 ) -> None:
-    today = _today_local()
+    await state.update_data(
+        person_id=person_id,
+        product_id=product_id,
+        partner_id=partner_id,
+    )
+    await state.set_state(OpenSubFSM.starts_on)
+    await message.answer(_PROMPT_START_DATE)
+
+
+async def _finalize_open_subscription(
+    message: Message,
+    state: FSMContext,
+    *,
+    person_id: str,
+    product_id: str,
+    partner_id: str | None,
+    starts_on: date,
+    amount_due: Decimal | None,
+    amount_paid: Decimal,
+    recorded_by_id: str,
+) -> None:
     async with async_session_maker() as session:
         person = await session.get(Person, person_id)
         product = await session.get(Product, product_id)
@@ -121,8 +200,12 @@ async def _report_open_subscription(
                 session,
                 person_id,
                 product_id,
-                today,
+                starts_on,
                 partner_id=partner_id,
+                starts_on=starts_on,
+                amount_due=amount_due,
+                amount_paid=amount_paid,
+                recorded_by_id=recorded_by_id,
             )
             await session.commit()
         except ValueError as exc:
@@ -140,6 +223,119 @@ async def _report_open_subscription(
         else "Абонемент выдан"
     )
     await message.answer(short_report(title, names))
+
+
+@router.message(OpenSubFSM.starts_on)
+async def fsm_open_sub_starts_on(message: Message, state: FSMContext) -> None:
+    if not message.text or message.from_user is None:
+        return
+    if await _clear_open_sub_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        starts_on = parse_open_sub_start_date(message.text)
+    except ValueError:
+        await message.answer("Формат: ДД.ММ.ГГГГ")
+        return
+    data = await state.get_data()
+    product_id = data.get("product_id")
+    if not product_id:
+        await state.clear()
+        return
+    async with async_session_maker() as session:
+        price = await current_price(session, str(product_id), starts_on)
+    amount_due = price.amount if price is not None else None
+    await state.update_data(
+        starts_on=starts_on.isoformat(),
+        amount_due=str(amount_due) if amount_due is not None else None,
+    )
+    await state.set_state(OpenSubFSM.payment)
+    await message.answer(_PROMPT_PAYMENT)
+
+
+@router.message(OpenSubFSM.payment)
+async def fsm_open_sub_payment(message: Message, state: FSMContext) -> None:
+    if not message.text or message.from_user is None:
+        return
+    if await _clear_open_sub_cancel(message, state):
+        return
+    choice = parse_open_sub_payment_choice(message.text)
+    if choice is None:
+        await message.answer(_PROMPT_PAYMENT)
+        return
+    data = await state.get_data()
+    amount_due = _amount_due_from_fsm_data(data)
+    if choice == "partial":
+        await state.update_data(payment_choice=choice)
+        await state.set_state(OpenSubFSM.partial_amount)
+        await message.answer(_PROMPT_PARTIAL_AMOUNT)
+        return
+    async with async_session_maker() as session:
+        admin = await _require_admin_message_strict(message, session)
+        if admin is None:
+            await state.clear()
+            return
+    starts_on = date.fromisoformat(str(data["starts_on"]))
+    person_id = str(data["person_id"])
+    product_id = str(data["product_id"])
+    partner_raw = data.get("partner_id")
+    partner_id = str(partner_raw) if partner_raw is not None else None
+    amount_paid = amount_paid_for_open_sub(choice, amount_due)
+    await _finalize_open_subscription(
+        message,
+        state,
+        person_id=person_id,
+        product_id=product_id,
+        partner_id=partner_id,
+        starts_on=starts_on,
+        amount_due=amount_due,
+        amount_paid=amount_paid,
+        recorded_by_id=admin.id,
+    )
+
+
+@router.message(OpenSubFSM.partial_amount)
+async def fsm_open_sub_partial_amount(message: Message, state: FSMContext) -> None:
+    if not message.text or message.from_user is None:
+        return
+    if await _clear_open_sub_cancel(message, state):
+        return
+    try:
+        amount = parse_open_sub_amount(message.text)
+    except InvalidOperation:
+        await message.answer("Некорректная сумма.")
+        return
+    data = await state.get_data()
+    amount_due = _amount_due_from_fsm_data(data)
+    err = partial_amount_error(amount, amount_due)
+    if err is not None:
+        await message.answer(err)
+        return
+    async with async_session_maker() as session:
+        admin = await _require_admin_message_strict(message, session)
+        if admin is None:
+            await state.clear()
+            return
+    starts_on = date.fromisoformat(str(data["starts_on"]))
+    person_id = str(data["person_id"])
+    product_id = str(data["product_id"])
+    partner_raw = data.get("partner_id")
+    partner_id = str(partner_raw) if partner_raw is not None else None
+    amount_paid = amount_paid_for_open_sub("partial", amount_due, amount)
+    await _finalize_open_subscription(
+        message,
+        state,
+        person_id=person_id,
+        product_id=product_id,
+        partner_id=partner_id,
+        starts_on=starts_on,
+        amount_due=amount_due,
+        amount_paid=amount_paid,
+        recorded_by_id=admin.id,
+    )
 
 @router.callback_query(F.data.startswith("open_sub_p:"))
 async def cb_open_sub_person(query: CallbackQuery, state: FSMContext) -> None:

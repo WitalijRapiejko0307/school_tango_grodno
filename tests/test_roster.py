@@ -270,6 +270,34 @@ def test_local_ocr_line_keeps_letters_and_inner_hyphen() -> None:
     assert clean_local_ocr_line("| _") == ""
 
 
+def test_roster_role_labels() -> None:
+    from app.channels.telegram.groups import _roster_role_label
+    from app.models import Person
+
+    assert _roster_role_label(Person(full_name="G", role="guest"), False) == "гость"
+    assert _roster_role_label(Person(full_name="C", role="client"), False) == "клиент"
+    assert _roster_role_label(Person(full_name="A", role="admin"), False) == "админ"
+    assert (
+        _roster_role_label(Person(full_name="A", role="admin"), True)
+        == "админ, клиент"
+    )
+
+
+def test_user_session_datetime_includes_weekday() -> None:
+    from datetime import timezone
+
+    from app.channels.telegram.groups import (
+        _format_user_session_date,
+        _format_user_session_datetime,
+    )
+
+    # 2026-10-28 is Wednesday in Europe/Minsk when using UTC noon
+    dt = datetime(2026, 10, 28, 12, 0, tzinfo=timezone.utc)
+    formatted = _format_user_session_datetime(dt)
+    assert formatted.startswith("среда, 28.10.2026")
+    assert _format_user_session_date(date(2026, 10, 28)) == "среда, 28.10.2026"
+
+
 def test_numbered_lines_replace_draft_rows_instead_of_new_list() -> None:
     from app.channels.telegram import _apply_roster_replacements, _parse_lines_to_draft_dicts
 

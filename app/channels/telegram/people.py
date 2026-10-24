@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -14,17 +14,36 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from sqlalchemy import select
+from sqlalchemy import desc, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import async_session_maker
-from app.models import ContactCard, Group, GroupMembership, Person
+from app.models import (
+    Attendance,
+    ContactCard,
+    Group,
+    GroupMembership,
+    Payment,
+    Person,
+    Product,
+    SchoolSession,
+    Subscription,
+)
+from app.services.billing import (
+    person_has_unpaid_started,
+    replace_partner,
+    subscription_payment_status,
+)
 from app.services.contacts import (
     archive_contact,
+    contact_for_person,
+    create_contact,
     list_contacts,
     restore_contact,
     update_contact,
 )
+from app.services.school_time import format_school_date, school_tz
+from app.services.user_labels import format_person_list_detail, format_person_role_label
 from app.services.identity import demote_admin, invite_admin
 from app.services.pick_list import (
     HINT_INDEX,
@@ -83,6 +102,56 @@ async def _active_membership(
 
 _HOMONYM_PICK_ERROR = "Несколько людей с таким именем — отправьте номер из списка."
 
+_WEEKDAY_FULL_RU = (
+    "понедельник",
+    "вторник",
+    "среда",
+    "четверг",
+    "пятница",
+    "суббота",
+    "воскресенье",
+)
+
+_PAIR_ERROR_RU = {
+    "subscription product is not for couples": "не парный абонемент",
+    "partner must differ from the primary person": "партнёр должен отличаться",
+    "person already has an active couple subscription": "у человека уже есть пара",
+}
+
+
+def _pair_error_message(exc: ValueError) -> str:
+    return _PAIR_ERROR_RU.get(str(exc), "Не удалось изменить пару.")
+
+
+def _session_visit_line(session: SchoolSession) -> str:
+    if session.session_date is not None:
+        day = session.session_date
+    else:
+        starts = session.starts_at
+        if starts.tzinfo is None:
+            day = starts.replace(tzinfo=school_tz()).date()
+        else:
+            day = starts.astimezone(school_tz()).date()
+    weekday = _WEEKDAY_FULL_RU[day.weekday()]
+    return f"{weekday}, {format_school_date(day)}"
+
+
+def _subscription_period_label(sub: Subscription) -> str:
+    if sub.starts_on is None:
+        if sub.valid_until is not None:
+            return f"с первого визита — {format_school_date(sub.valid_until)}"
+        return "с первого визита"
+    start = format_school_date(sub.starts_on)
+    if sub.valid_until is not None:
+        return f"{start}–{format_school_date(sub.valid_until)}"
+    return start
+
+
+def _is_client_like(person: Person, membership: GroupMembership | None) -> bool:
+    return person.role == "client" or (
+        person.role == "admin" and membership is not None
+    )
+
 
 async def _person_group_detail(session: AsyncSession, person_id: str) -> str:
     membership = await _active_membership(session, person_id)
@@ -92,6 +161,18 @@ async def _person_group_detail(session: AsyncSession, person_id: str) -> str:
     return group.name if group is not None else "без группы"
 
 
+async def _person_pick_detail(
+    session: AsyncSession, person: Person, today: date
+) -> str:
+    membership = await _active_membership(session, person.id)
+    group_name = await _person_group_detail(session, person.id)
+    role_label = format_person_role_label(
+        person.role, membership is not None
+    )
+    unpaid = await person_has_unpaid_started(session, person.id, today)
+    return format_person_list_detail(group_name, role_label, unpaid)
+
+
 async def _pick_rows_for_ids(
     session: AsyncSession, pick_ids: list[str], *, with_group_detail: bool
 ) -> list[PickRow]:
@@ -99,13 +180,60 @@ async def _pick_rows_for_ids(
         return []
     result = await session.execute(select(Person).where(Person.id.in_(pick_ids)))
     by_id = {p.id: p for p in result.scalars().all()}
+    today = _today_local()
     rows: list[PickRow] = []
     for person_id in pick_ids:
         person = by_id.get(person_id)
         if person is None:
             continue
-        detail = await _person_group_detail(session, person_id) if with_group_detail else ""
+        if with_group_detail:
+            detail = await _person_pick_detail(session, person, today)
+        else:
+            detail = ""
         rows.append(PickRow(id=person.id, full_name=person.full_name, detail=detail))
+    return rows
+
+
+async def _list_all_people_pick_rows(session: AsyncSession) -> list[PickRow]:
+    people = list(
+        (
+            await session.execute(
+                select(Person)
+                .where(Person.archived_at.is_(None))
+                .order_by(Person.full_name)
+            )
+        ).scalars().all()
+    )
+    today = _today_local()
+    rows: list[PickRow] = []
+    for person in people:
+        detail = await _person_pick_detail(session, person, today)
+        rows.append(PickRow(id=person.id, full_name=person.full_name, detail=detail))
+    return rows
+
+
+async def _list_group_client_pick_rows(
+    session: AsyncSession,
+    group_id: str,
+    *,
+    exclude_person_id: str | None = None,
+) -> list[PickRow]:
+    result = await session.execute(
+        select(Person)
+        .join(GroupMembership, GroupMembership.person_id == Person.id)
+        .where(
+            GroupMembership.group_id == group_id,
+            GroupMembership.ended_on.is_(None),
+            Person.role == "client",
+            Person.archived_at.is_(None),
+        )
+        .order_by(Person.full_name)
+    )
+    rows: list[PickRow] = []
+    for person in result.scalars().all():
+        if exclude_person_id is not None and person.id == exclude_person_id:
+            continue
+        rows.append(PickRow(id=person.id, full_name=person.full_name))
     return rows
 
 
@@ -164,35 +292,74 @@ async def _list_archived_client_rows(session: AsyncSession) -> list[Person]:
     )
 
 
-def _person_card_keyboard(person_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+async def _person_card_keyboard(
+    session: AsyncSession, person_id: str
+) -> InlineKeyboardMarkup | None:
+    person = await session.get(Person, person_id)
+    if person is None or person.archived_at is not None:
+        return None
+    membership = await _active_membership(session, person_id)
+    rows: list[list[InlineKeyboardButton]] = [
+        [
+            InlineKeyboardButton(
+                text="В группу",
+                callback_data=f"ppl_to_grp:{person_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Из группы",
+                callback_data=f"ppl_from_grp:{person_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Изменить карточку",
+                callback_data=f"ppl_edit:{person_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                text="Убрать клиента",
+                callback_data=f"ppl_arch_ask:{person_id}",
+            )
+        ],
+    ]
+    if _is_client_like(person, membership):
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="В группу",
-                    callback_data=f"ppl_to_grp:{person_id}",
+                    text="Абонементы",
+                    callback_data=f"ppl_subs:{person_id}",
                 )
-            ],
+            ]
+        )
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="Из группы",
-                    callback_data=f"ppl_from_grp:{person_id}",
+                    text="Посещения",
+                    callback_data=f"ppl_visits:{person_id}",
                 )
-            ],
+            ]
+        )
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="Изменить карточку",
-                    callback_data=f"ppl_edit:{person_id}",
+                    text="Оплаты",
+                    callback_data=f"ppl_pays:{person_id}",
                 )
-            ],
+            ]
+        )
+    if person.role == "admin":
+        rows.append(
             [
                 InlineKeyboardButton(
-                    text="Убрать клиента",
-                    callback_data=f"ppl_arch_ask:{person_id}",
+                    text="Контакт для клиентов",
+                    callback_data=f"ppl_contact:{person_id}",
                 )
-            ],
-        ]
-    )
+            ]
+        )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _person_card_text(session: AsyncSession, person_id: str) -> str | None:
@@ -207,13 +374,21 @@ async def _person_card_text(session: AsyncSession, person_id: str) -> str | None
     return "\n".join(lines)
 
 
-async def _send_person_card(message: Message, person_id: str) -> None:
+async def send_person_card(message: Message, person_id: str) -> None:
     async with async_session_maker() as session:
         text = await _person_card_text(session, person_id)
-    if text is None:
+        if text is None:
+            await message.answer("Не найдено")
+            return
+        keyboard = await _person_card_keyboard(session, person_id)
+    if keyboard is None:
         await message.answer("Не найдено")
         return
-    await message.answer(text, reply_markup=_person_card_keyboard(person_id))
+    await message.answer(text, reply_markup=keyboard)
+
+
+async def _send_person_card(message: Message, person_id: str) -> None:
+    await send_person_card(message, person_id)
 
 
 async def _prompt_leave_person(
@@ -523,7 +698,7 @@ async def cb_ppl_list(query: CallbackQuery, state: FSMContext) -> None:
     if await _require_admin_callback(query) is None:
         return
     async with async_session_maker() as session:
-        rows = await _list_active_client_pick_rows(session)
+        rows = await _list_all_people_pick_rows(session)
     if not rows:
         await query.answer("Нет людей", show_alert=True)
         return
@@ -534,7 +709,7 @@ async def cb_ppl_list(query: CallbackQuery, state: FSMContext) -> None:
             state,
             purpose="view",
             rows=rows,
-            title="Номер откроет карточку клиента.",
+            title="Номер откроет карточку.",
         )
 
 
@@ -680,6 +855,198 @@ async def cb_ppl_from_grp(query: CallbackQuery, state: FSMContext) -> None:
     await query.answer()
     if query.message:
         await _prompt_leave_person(query.message, state, person_id)
+
+
+async def _format_person_subscriptions(
+    session: AsyncSession, person_id: str
+) -> tuple[str, InlineKeyboardMarkup | None]:
+    result = await session.execute(
+        select(Subscription)
+        .where(
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            )
+        )
+        .order_by(desc(Subscription.created_at))
+    )
+    subs = list(result.scalars().all())
+    if not subs:
+        return "Абонементов нет.", None
+    lines: list[str] = ["Абонементы:"]
+    buttons: list[list[InlineKeyboardButton]] = []
+    for sub in subs:
+        product = await session.get(Product, sub.product_id)
+        product_name = product.name if product is not None else "?"
+        partner_line = ""
+        if sub.partner_id:
+            partner = await session.get(Person, sub.partner_id)
+            if partner is not None:
+                partner_line = f"\nПартнёр: {partner.full_name}"
+        period = _subscription_period_label(sub)
+        status = subscription_payment_status(sub)
+        unpaid = " — не оплачен" if status == "unpaid" else ""
+        lines.append(
+            f"\n{product_name}{partner_line}\n"
+            f"{period}\n"
+            f"Осталось занятий: {sub.lessons_left}{unpaid}"
+        )
+        if product is not None and product.audience == "couple":
+            buttons.append(
+                [
+                    InlineKeyboardButton(
+                        text="Изменить пару",
+                        callback_data=f"ppl_pair:{sub.id}",
+                    )
+                ]
+            )
+    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
+    return "\n".join(lines), kb
+
+
+async def _format_person_visits(session: AsyncSession, person_id: str) -> str:
+    result = await session.execute(
+        select(Attendance, SchoolSession)
+        .join(SchoolSession, Attendance.session_id == SchoolSession.id)
+        .where(Attendance.person_id == person_id)
+        .order_by(desc(SchoolSession.starts_at))
+    )
+    rows = result.all()
+    if not rows:
+        return "Посещений нет."
+    lines = ["Посещения:"]
+    for _att, school_session in rows:
+        lines.append(f"• {_session_visit_line(school_session)}")
+    return "\n".join(lines)
+
+
+async def _format_person_payments(session: AsyncSession, person_id: str) -> str:
+    result = await session.execute(
+        select(Payment, Subscription, Product)
+        .join(Subscription, Payment.subscription_id == Subscription.id)
+        .join(Product, Subscription.product_id == Product.id)
+        .where(
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            )
+        )
+        .order_by(desc(Payment.paid_on), desc(Payment.created_at))
+    )
+    rows = result.all()
+    if not rows:
+        return "Оплат нет."
+    lines = ["Оплаты:"]
+    for payment, _sub, product in rows:
+        lines.append(
+            f"• {format_school_date(payment.paid_on)} — "
+            f"{payment.amount} — {product.name}"
+        )
+    return "\n".join(lines)
+
+
+@router.callback_query(F.data.startswith("ppl_subs:"))
+async def cb_ppl_subs(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        text, kb = await _format_person_subscriptions(session, person_id)
+    await query.answer()
+    if query.message:
+        await query.message.answer(text, reply_markup=kb)
+
+
+@router.callback_query(F.data.startswith("ppl_visits:"))
+async def cb_ppl_visits(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        text = await _format_person_visits(session, person_id)
+    await query.answer()
+    if query.message:
+        await query.message.answer(text)
+
+
+@router.callback_query(F.data.startswith("ppl_pays:"))
+async def cb_ppl_pays(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        text = await _format_person_payments(session, person_id)
+    await query.answer()
+    if query.message:
+        await query.message.answer(text)
+
+
+@router.callback_query(F.data.startswith("ppl_pair:"))
+async def cb_ppl_pair(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    subscription_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        sub = await session.get(Subscription, subscription_id)
+        if sub is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        membership = await _active_membership(session, sub.person_id)
+        if membership is None:
+            await query.answer("Нет активной группы", show_alert=True)
+            return
+        rows = await _list_group_client_pick_rows(
+            session,
+            membership.group_id,
+            exclude_person_id=sub.person_id,
+        )
+    if not rows:
+        await query.answer("Нет других клиентов в группе", show_alert=True)
+        return
+    await query.answer()
+    if query.message:
+        await _start_people_pick(
+            query.message,
+            state,
+            purpose="ppl_pair",
+            rows=rows,
+            title="Номер выберет нового партнёра пары.",
+        )
+        await state.update_data(pair_subscription_id=subscription_id)
+
+
+@router.callback_query(F.data.startswith("ppl_contact:"))
+async def cb_ppl_contact(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        person = await session.get(Person, person_id)
+        if person is None or person.role != "admin":
+            await query.answer("Не найдено", show_alert=True)
+            return
+        card = await contact_for_person(session, person_id)
+    await query.answer()
+    if query.message is None:
+        return
+    if card is not None:
+        await state.set_state(ContactEditFSM.name)
+        await state.update_data(edit_contact_id=card.id)
+        await query.message.answer('Имя. «то же» — не менять.')
+        return
+    await state.set_state(ContactFSM.name)
+    await state.update_data(contact_person_id=person_id)
+    await query.message.answer("Имя контакта:")
 
 
 @router.callback_query(F.data.startswith("ppl_edit:"))
@@ -940,14 +1307,12 @@ async def menu_people(message: Message) -> None:
             return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
-            [InlineKeyboardButton(text="Список клиентов", callback_data="ppl_list")],
-            [InlineKeyboardButton(text="Добавить клиента", callback_data="ppl_add")],
-            [InlineKeyboardButton(text="Архив клиентов", callback_data="ppl_arch")],
-            [InlineKeyboardButton(text="Гости", callback_data="ppl_guests")],
-            [InlineKeyboardButton(text="Админы", callback_data="ppl_admins")],
+            [InlineKeyboardButton(text="Список", callback_data="ppl_list")],
+            [InlineKeyboardButton(text="Добавить", callback_data="ppl_add")],
+            [InlineKeyboardButton(text="Архив", callback_data="ppl_arch")],
         ]
     )
-    await message.answer("Люди — выберите действие:", reply_markup=kb)
+    await message.answer("Пользователи — выберите действие:", reply_markup=kb)
 @router.callback_query(F.data == "ppl_admins")
 async def cb_ppl_admins(query: CallbackQuery) -> None:
     if await _require_admin_callback(query) is None:
@@ -1031,6 +1396,23 @@ async def fsm_people_pick_waiting(message: Message, state: FSMContext) -> None:
                 await _send_people_pick_page(message, homonym_rows, 0)
                 return
         await message.answer(exc.message)
+        return
+    if purpose == "ppl_pair":
+        sub_id = data.get("pair_subscription_id")
+        if not sub_id:
+            await state.clear()
+            await message.answer("Ошибка")
+            return
+        async with async_session_maker() as session:
+            try:
+                await replace_partner(session, str(sub_id), picked.id)
+                await session.commit()
+            except ValueError as exc:
+                await message.answer(_pair_error_message(exc))
+                return
+        await state.clear()
+        partner_name = picked.full_name
+        await message.answer(short_report(f"Партнёр: {partner_name}", []))
         return
     from .groups import _after_people_pick
 
@@ -1238,17 +1620,23 @@ async def fsm_contact_role(message: Message, state: FSMContext) -> None:
     if not message.text or message.from_user is None:
         return
     data = await state.get_data()
+    person_id = data.get("contact_person_id")
     async with async_session_maker() as session:
         if await _require_admin_message_strict(message, session) is None:
             await state.clear()
             return
-        card = ContactCard(
-            name=data["contact_name"],
-            phone=data["contact_phone"],
-            role_label=message.text.strip(),
-        )
-        session.add(card)
-        await session.commit()
+        try:
+            await create_contact(
+                session,
+                data["contact_name"],
+                data["contact_phone"],
+                message.text.strip(),
+                person_id=str(person_id) if person_id else None,
+            )
+            await session.commit()
+        except ValueError:
+            await message.answer("Не удалось сохранить контакт.")
+            return
     await message.answer("Контакт сохранён.")
     await state.clear()
 

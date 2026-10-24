@@ -220,6 +220,28 @@ class Subscription(Base):
     )
     lessons_left: Mapped[int] = mapped_column(Integer, nullable=False)
     valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
+    starts_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    amount_due: Mapped[Decimal | None] = mapped_column(Numeric(10, 2), nullable=True)
+    amount_paid: Mapped[Decimal] = mapped_column(
+        Numeric(10, 2), nullable=False, server_default="0"
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    subscription_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("subscriptions.id"), nullable=False
+    )
+    amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
+    paid_on: Mapped[date] = mapped_column(Date, nullable=False)
+    recorded_by_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("persons.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -352,6 +374,43 @@ class GuestRsvp(Base):
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="planned")
 
 
+class DayGatherResponse:
+    """Values for DayGather.response (morning RSVP)."""
+
+    NONE = "none"
+    COMING = "coming"
+    DECLINED = "declined"
+
+
+class DayGather(Base):
+    __tablename__ = "day_gathers"
+    __table_args__ = (
+        UniqueConstraint(
+            "person_id",
+            "stream_id",
+            "gather_date",
+            name="uq_day_gathers_person_stream_date",
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    person_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("persons.id"), nullable=False
+    )
+    stream_id: Mapped[str] = mapped_column(
+        String(36), ForeignKey("streams.id"), nullable=False
+    )
+    gather_date: Mapped[date] = mapped_column(Date, nullable=False)
+    sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    response: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+    selected_session_ids: Mapped[str | None] = mapped_column(Text, nullable=True)
+    nudge_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+
+
 class ContactCard(Base):
     __tablename__ = "contact_cards"
 
@@ -359,6 +418,9 @@ class ContactCard(Base):
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     phone: Mapped[str] = mapped_column(String(32), nullable=False)
     role_label: Mapped[str] = mapped_column(String(255), nullable=False)
+    person_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("persons.id"), nullable=True
+    )
     archived_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )

@@ -160,7 +160,7 @@ def test_role_keyboard_admin() -> None:
     assert buttons == [
         "Сегодня",
         "Группы",
-        "Люди",
+        "Пользователи",
         "Прайс",
         "Напоминания",
         "Сообщение",
@@ -171,9 +171,8 @@ def test_role_keyboard_client() -> None:
     buttons = role_keyboard("client")
     assert buttons == [
         "Прайс",
-        "Моя группа",
-        "Не со своей группой",
-        "Остаток",
+        "Абонементы",
+        "Занятия",
     ]
 
 

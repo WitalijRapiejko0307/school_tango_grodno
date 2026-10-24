@@ -48,8 +48,10 @@ ARCHIVED_ACCESS_CLOSED = "Доступ закрыт."
 
 BTN_TODAY = "Сегодня"
 BTN_GROUPS = "Группы"
-BTN_PEOPLE = "Люди"
+BTN_PEOPLE = "Пользователи"
 BTN_PRICE = "Прайс"
+BTN_CLIENT_SUBS = "Абонементы"
+BTN_CLIENT_CLASSES = "Занятия"
 BTN_REMINDERS = "Напоминания"
 BTN_NOTICE = "Сообщение"
 BTN_MY_GROUP = "Моя группа"
@@ -66,7 +68,7 @@ ADMIN_MENU = [
     BTN_REMINDERS,
     BTN_NOTICE,
 ]
-CLIENT_MENU = [BTN_PRICE, BTN_MY_GROUP, BTN_OTHER_GROUP, BTN_BALANCE]
+CLIENT_MENU = [BTN_PRICE, BTN_CLIENT_SUBS, BTN_CLIENT_CLASSES]
 GUEST_MENU = [BTN_SCHEDULE, BTN_CONTACTS]
 
 REFUSAL = "Эта команда доступна только администраторам."
