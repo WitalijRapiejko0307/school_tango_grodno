@@ -173,8 +173,16 @@ async def _person_pick_detail(
     return format_person_list_detail(group_name, role_label, unpaid)
 
 
+def _people_pick_shows_group(purpose: str) -> bool:
+    return purpose in ("assign", "card", "leave")
+
+
 async def _pick_rows_for_ids(
-    session: AsyncSession, pick_ids: list[str], *, with_group_detail: bool
+    session: AsyncSession,
+    pick_ids: list[str],
+    *,
+    with_group_detail: bool,
+    unpaid_only: bool = False,
 ) -> list[PickRow]:
     if not pick_ids:
         return []
@@ -188,6 +196,8 @@ async def _pick_rows_for_ids(
             continue
         if with_group_detail:
             detail = await _person_pick_detail(session, person, today)
+        elif unpaid_only and await person_has_unpaid_started(session, person.id, today):
+            detail = "не оплачен"
         else:
             detail = ""
         rows.append(PickRow(id=person.id, full_name=person.full_name, detail=detail))
@@ -650,10 +660,13 @@ async def cb_people_pick_more(query: CallbackQuery, state: FSMContext) -> None:
     pick_ids: list[str] = list(data.get("pick_ids") or [])
     page = int(data.get("pick_page") or 0) + 1
     purpose = str(data.get("pick_purpose") or "")
-    with_group_detail = purpose in ("assign", "card", "leave", "view")
+    with_group_detail = _people_pick_shows_group(purpose)
     async with async_session_maker() as session:
         rows = await _pick_rows_for_ids(
-            session, pick_ids, with_group_detail=with_group_detail
+            session,
+            pick_ids,
+            with_group_detail=with_group_detail,
+            unpaid_only=purpose == "view",
         )
     if not rows or page >= (len(rows) + 19) // 20:
         await query.answer("Больше нет")
@@ -1390,10 +1403,13 @@ async def fsm_people_pick_waiting(message: Message, state: FSMContext) -> None:
     data = await state.get_data()
     pick_ids: list[str] = list(data.get("pick_ids") or [])
     purpose = str(data.get("pick_purpose") or "")
-    with_group_detail = purpose in ("assign", "card", "leave", "view")
+    with_group_detail = _people_pick_shows_group(purpose)
     async with async_session_maker() as session:
         rows = await _pick_rows_for_ids(
-            session, pick_ids, with_group_detail=with_group_detail
+            session,
+            pick_ids,
+            with_group_detail=with_group_detail,
+            unpaid_only=purpose == "view",
         )
     try:
         picked = resolve_picks(rows, message.text, many=False)[0]
@@ -1409,6 +1425,7 @@ async def fsm_people_pick_waiting(message: Message, state: FSMContext) -> None:
                         session,
                         homonym_ids,
                         with_group_detail=with_group_detail,
+                        unpaid_only=purpose == "view",
                     )
                 await state.update_data(pick_ids=homonym_ids, pick_page=0)
                 await message.answer(exc.message)
