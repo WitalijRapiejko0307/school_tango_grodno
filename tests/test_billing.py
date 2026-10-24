@@ -14,6 +14,7 @@ from app.services.billing import (
     deactivate_product,
     list_active_products_with_prices,
     open_subscription,
+    list_payable_subscriptions,
     person_has_unpaid_started,
     record_payment,
     replace_partner,
@@ -505,3 +506,45 @@ async def test_replace_partner_self_raises(db_session: AsyncSession) -> None:
     )
     with pytest.raises(ValueError, match="partner must differ"):
         await replace_partner(db_session, sub.id, primary.id)
+
+
+async def test_partial_then_full_payment_clears_unpaid_for_couple(
+    db_session: AsyncSession,
+) -> None:
+    primary = Person(full_name="Иванов Иван", role="client", telegram_user_id=1)
+    partner = Person(full_name="Иванова Анна", role="client", telegram_user_id=2)
+    db_session.add_all([primary, partner])
+    await db_session.flush()
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Пара",
+        lessons_count=8,
+        validity_days=28,
+        audience="couple",
+    )
+    today = date(2026, 10, 24)
+    sub = await open_subscription(
+        db_session,
+        primary.id,
+        product.id,
+        started_on=today,
+        partner_id=partner.id,
+        starts_on=today,
+        amount_due=Decimal("160.00"),
+        amount_paid=Decimal("0"),
+    )
+    assert await person_has_unpaid_started(db_session, primary.id, today)
+    assert await person_has_unpaid_started(db_session, partner.id, today)
+    payable = await list_payable_subscriptions(db_session, partner.id, today)
+    assert [row.id for row in payable] == [sub.id]
+
+    await record_payment(db_session, sub.id, Decimal("60.00"), today, primary.id)
+    assert subscription_payment_status(sub) == "unpaid"
+    assert await person_has_unpaid_started(db_session, partner.id, today)
+
+    await record_payment(db_session, sub.id, Decimal("100.00"), today, primary.id)
+    assert subscription_payment_status(sub) == "paid"
+    assert not await person_has_unpaid_started(db_session, primary.id, today)
+    assert not await person_has_unpaid_started(db_session, partner.id, today)
+    assert await list_payable_subscriptions(db_session, primary.id, today) == []

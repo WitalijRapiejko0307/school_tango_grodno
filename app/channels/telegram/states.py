@@ -100,6 +100,10 @@ class PeoplePickFSM(StatesGroup):
     card_phone = State()
 
 
+class PayInFSM(StatesGroup):
+    amount = State()
+
+
 class PeopleAddFSM(StatesGroup):
     name = State()
 
@@ -121,3 +125,8 @@ class NoticeFSM(StatesGroup):
 
 class GroupRenameFSM(StatesGroup):
     waiting_name = State()
+
+
+class TabelFSM(StatesGroup):
+    date_from = State()
+    date_to = State()

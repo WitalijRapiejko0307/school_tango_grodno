@@ -9,6 +9,7 @@ from datetime import UTC, date, datetime, timedelta
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
+    BufferedInputFile,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -29,6 +30,7 @@ from app.models import (
     WeeklySlot,
 )
 from app.services.attendance import mark_attendance
+from app.services.attendance_sheet import build_group_attendance_workbook
 from app.services.notices import (
     cancel_notice_text,
     group_audience,
@@ -72,7 +74,7 @@ from app.services.schedule import (
     set_group_stream,
     update_weekly_slot,
 )
-from app.services.school_time import format_school_date, format_school_datetime
+from app.services.school_time import format_school_date, format_school_datetime, school_tz
 
 from .common import (
     BTN_GROUPS,
@@ -105,6 +107,7 @@ from .states import (
     NewGroupFSM,
     PeoplePickFSM,
     RosterFSM,
+    TabelFSM,
     WeekFSM,
 )
 
@@ -1246,6 +1249,10 @@ def _group_card_keyboard(group_id: str) -> InlineKeyboardMarkup:
                     text="Расписание",
                     callback_data=f"grp_sched:{group_id}",
                 ),
+                InlineKeyboardButton(
+                    text="Табель",
+                    callback_data=f"grp_tabel:{group_id}",
+                ),
             ],
             [
                 InlineKeyboardButton(
@@ -1554,6 +1561,192 @@ async def cb_grp_schedule(query: CallbackQuery) -> None:
             f"{school_session.place}"
         )
     await query.message.answer("\n".join(lines))
+
+
+def _tabel_period_keyboard(group_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Этот месяц",
+                    callback_data=f"grp_tabel_m:{group_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Прошлый месяц",
+                    callback_data=f"grp_tabel_p:{group_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Свои даты",
+                    callback_data=f"grp_tabel_c:{group_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def _tabel_this_month_range() -> tuple[date, date]:
+    today = datetime.now(school_tz()).date()
+    return today.replace(day=1), today
+
+
+def _tabel_prev_month_range() -> tuple[date, date]:
+    today = datetime.now(school_tz()).date()
+    first_this = today.replace(day=1)
+    last_prev = first_this - timedelta(days=1)
+    return last_prev.replace(day=1), last_prev
+
+
+async def _send_group_tabel(
+    message: Message,
+    state: FSMContext,
+    group_id: str,
+    date_from: date,
+    date_to: date,
+) -> None:
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await state.clear()
+            await message.answer("Не найдено")
+            return
+        gname = group.name
+        workbook = await build_group_attendance_workbook(
+            session, group_id, date_from, date_to
+        )
+        await session.commit()
+    await state.clear()
+    if workbook is None:
+        await message.answer("В этом периоде нет занятий.")
+        return
+    caption = (
+        f"{gname}\n{format_school_date(date_from)} — {format_school_date(date_to)}"
+    )
+    await message.answer_document(
+        BufferedInputFile(workbook, filename="Tabel.xlsx"),
+        caption=caption,
+    )
+
+
+@router.callback_query(F.data.startswith("grp_tabel:"))
+async def cb_grp_tabel(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            "Период табеля:",
+            reply_markup=_tabel_period_keyboard(group_id),
+        )
+
+
+@router.callback_query(F.data.startswith("grp_tabel_m:"))
+async def cb_grp_tabel_this_month(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    date_from, date_to = _tabel_this_month_range()
+    await query.answer()
+    await _send_group_tabel(query.message, state, group_id, date_from, date_to)
+
+
+@router.callback_query(F.data.startswith("grp_tabel_p:"))
+async def cb_grp_tabel_prev_month(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    date_from, date_to = _tabel_prev_month_range()
+    await query.answer()
+    await _send_group_tabel(query.message, state, group_id, date_from, date_to)
+
+
+@router.callback_query(F.data.startswith("grp_tabel_c:"))
+async def cb_grp_tabel_custom(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+    await state.set_state(TabelFSM.date_from)
+    await state.update_data(tabel_group_id=group_id)
+    await query.answer()
+    await query.message.answer("Дата с (ДД.ММ.ГГГГ):")
+
+
+@router.message(TabelFSM.date_from)
+async def fsm_tabel_date_from(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Создание табеля отменено.")
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        date_from = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Формат: ДД.ММ.ГГГГ")
+        return
+    await state.update_data(tabel_date_from=date_from.isoformat())
+    await state.set_state(TabelFSM.date_to)
+    await message.answer("Дата по (ДД.ММ.ГГГГ):")
+
+
+@router.message(TabelFSM.date_to)
+async def fsm_tabel_date_to(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Создание табеля отменено.")
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        date_to = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Формат: ДД.ММ.ГГГГ")
+        return
+    data = await state.get_data()
+    group_id = data.get("tabel_group_id")
+    raw_from = data.get("tabel_date_from")
+    if not group_id or not raw_from:
+        await state.clear()
+        await message.answer("Сначала выберите группу.")
+        return
+    date_from = date.fromisoformat(str(raw_from))
+    if date_to < date_from:
+        await message.answer("Дата «по» раньше даты «с».")
+        return
+    await _send_group_tabel(message, state, str(group_id), date_from, date_to)
 
 
 @router.callback_query(F.data.startswith("grp_ren:"))

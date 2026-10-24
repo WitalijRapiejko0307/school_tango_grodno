@@ -525,6 +525,62 @@ async def test_subscription_low_only_at_one_lesson_and_once(
     assert lows[0].reminder_id != low[0].reminder_id
 
 
+async def test_subscription_ending_two_days_before_with_lessons_left(
+    db_session: AsyncSession,
+) -> None:
+    person, _ = await _client_in_group(db_session)
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=28,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 10, 1),
+        starts_on=date(2026, 10, 1),
+    )
+    sub.valid_until = date(2026, 10, 26)
+    sub.lessons_left = 3
+    await db_session.flush()
+
+    too_early = datetime(2026, 10, 23, 12, 0, tzinfo=MINSK)
+    due_early = await plan_due(db_session, too_early)
+    assert not [
+        d
+        for d in due_early
+        if d.kind == "subscription_ending" and d.person_id == person.id
+    ]
+
+    on_day = datetime(2026, 10, 24, 12, 0, tzinfo=MINSK)
+    due = await plan_due(db_session, on_day)
+    ending = [
+        d for d in due if d.kind == "subscription_ending" and d.person_id == person.id
+    ]
+    assert len(ending) == 1
+    assert "через два дня" in ending[0].text
+    await mark_sent(db_session, ending[0].reminder_id, on_day)
+    again = await plan_due(db_session, on_day + timedelta(hours=2))
+    assert not [
+        d
+        for d in again
+        if d.kind == "subscription_ending" and d.person_id == person.id
+    ]
+
+    sub.lessons_left = 0
+    sub.valid_until = date(2026, 10, 28)
+    await db_session.flush()
+    empty = await plan_due(db_session, datetime(2026, 10, 26, 12, 0, tzinfo=MINSK))
+    assert not [
+        d
+        for d in empty
+        if d.kind == "subscription_ending" and d.person_id == person.id
+    ]
+
+
 async def test_admin_session_summary_one_per_admin_with_counts(
     db_session: AsyncSession,
 ) -> None:

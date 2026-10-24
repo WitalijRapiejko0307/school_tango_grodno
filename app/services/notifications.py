@@ -392,6 +392,55 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
                 )
             )
 
+    ending_target = local_today + timedelta(days=2)
+    subs_ending_result = await session.execute(
+        select(Subscription).where(
+            Subscription.lessons_left > 0,
+            Subscription.valid_until.is_not(None),
+            Subscription.valid_until == ending_target,
+        )
+    )
+    subscription_ending_text = (
+        "Срок абонемента заканчивается через два дня, неиспользованные занятия сгорят."
+    )
+    for sub in subs_ending_result.scalars().all():
+        holder_ids = [sub.person_id]
+        if sub.partner_id is not None:
+            holder_ids.append(sub.partner_id)
+        for holder_id in holder_ids:
+            existing = await _find_reminder(
+                session,
+                holder_id,
+                "subscription_ending",
+                subscription_id=sub.id,
+            )
+            if existing is not None:
+                if existing.sent_at is None:
+                    person, _ = await _person_telegram(session, holder_id)
+                    due.append(
+                        _due_from_reminder(
+                            existing,
+                            person,
+                            subscription_ending_text,
+                        )
+                    )
+                continue
+            reminder = Reminder(
+                person_id=holder_id,
+                kind="subscription_ending",
+                subscription_id=sub.id,
+            )
+            session.add(reminder)
+            await session.flush()
+            person, _ = await _person_telegram(session, holder_id)
+            due.append(
+                _due_from_reminder(
+                    reminder,
+                    person,
+                    subscription_ending_text,
+                )
+            )
+
     local_now = _to_local(now)
     if local_now.day == 1 and local_now.hour >= GUEST_MORNING_HOUR:
         prev_start, prev_end = _previous_calendar_month_bounds(now)

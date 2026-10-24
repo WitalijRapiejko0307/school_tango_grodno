@@ -137,6 +137,36 @@ async def record_payment(
     return payment
 
 
+async def payable_subscription(
+    session: AsyncSession, person_id: str, on_date: date
+) -> Subscription | None:
+    """Active subscription that still has an unpaid balance."""
+    sub = await active_subscription(session, person_id, on_date)
+    if sub is None or subscription_payment_status(sub) != "unpaid":
+        return None
+    return sub
+
+
+async def list_payable_subscriptions(
+    session: AsyncSession, person_id: str, on_date: date
+) -> list[Subscription]:
+    result = await session.execute(
+        select(Subscription)
+        .where(
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            ),
+            Subscription.lessons_left > 0,
+            (Subscription.valid_until.is_(None))
+            | (Subscription.valid_until >= on_date),
+        )
+        .order_by(Subscription.valid_until.asc().nullsfirst())
+    )
+    subs = list(result.scalars().all())
+    return [s for s in subs if subscription_payment_status(s) == "unpaid"]
+
+
 async def person_has_unpaid_started(
     session: AsyncSession, person_id: str, today: date
 ) -> bool:

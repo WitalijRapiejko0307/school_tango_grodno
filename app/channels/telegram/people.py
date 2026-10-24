@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import re
 from datetime import UTC, date, datetime
+from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
 from aiogram.fsm.context import FSMContext
@@ -30,7 +31,9 @@ from app.models import (
     Subscription,
 )
 from app.services.billing import (
+    list_payable_subscriptions,
     person_has_unpaid_started,
+    record_payment,
     replace_partner,
     subscription_payment_status,
 )
@@ -81,6 +84,7 @@ from .states import (
     AdminInviteFSM,
     ContactEditFSM,
     ContactFSM,
+    PayInFSM,
     PeopleAddFSM,
     PeoplePickFSM,
 )
@@ -331,7 +335,7 @@ async def _person_card_keyboard(
         ],
         [
             InlineKeyboardButton(
-                text="Убрать клиента",
+                text="Убрать в архив",
                 callback_data=f"ppl_arch_ask:{person_id}",
             )
         ],
@@ -948,6 +952,35 @@ async def _format_person_visits(session: AsyncSession, person_id: str) -> str:
     return "\n".join(lines)
 
 
+def _parse_payment_amount(text: str) -> Decimal:
+    return Decimal(text.strip().replace(",", "."))
+
+
+def _payments_keyboard(person_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Внести оплату",
+                    callback_data=f"ppl_payin:{person_id}",
+                )
+            ]
+        ]
+    )
+
+
+async def _payin_amount_prompt(session: AsyncSession, sub: Subscription) -> str:
+    product = await session.get(Product, sub.product_id)
+    name = product.name if product is not None else "?"
+    remainder = sub.amount_due - sub.amount_paid
+    return (
+        f"{name}\n"
+        f"Уже оплачено: {sub.amount_paid}\n"
+        f"Осталось: {remainder}\n"
+        "Сумма оплаты (число, запятая или точка):"
+    )
+
+
 async def _format_person_payments(session: AsyncSession, person_id: str) -> str:
     result = await session.execute(
         select(Payment, Subscription, Product)
@@ -1012,7 +1045,119 @@ async def cb_ppl_pays(query: CallbackQuery) -> None:
         text = await _format_person_payments(session, person_id)
     await query.answer()
     if query.message:
-        await query.message.answer(text)
+        await query.message.answer(text, reply_markup=_payments_keyboard(person_id))
+
+
+@router.callback_query(F.data.startswith("ppl_payin:"))
+async def cb_ppl_payin(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    today = datetime.now(school_tz()).date()
+    async with async_session_maker() as session:
+        subs = await list_payable_subscriptions(session, person_id, today)
+    if not subs:
+        await query.answer(
+            "Нет активного неоплаченного абонемента.", show_alert=True
+        )
+        return
+    await query.answer()
+    if query.message is None:
+        return
+    if len(subs) == 1:
+        sub = subs[0]
+        async with async_session_maker() as session:
+            prompt = await _payin_amount_prompt(session, sub)
+        await state.set_state(PayInFSM.amount)
+        await state.update_data(person_id=person_id, subscription_id=sub.id)
+        await query.message.answer(prompt)
+        return
+    async with async_session_maker() as session:
+        rows: list[list[InlineKeyboardButton]] = []
+        for sub in subs:
+            product = await session.get(Product, sub.product_id)
+            name = product.name if product is not None else "?"
+            rows.append(
+                [
+                    InlineKeyboardButton(
+                        text=name,
+                        callback_data=f"ppl_paypick:{sub.id}",
+                    )
+                ]
+            )
+    await state.update_data(person_id=person_id)
+    await query.message.answer(
+        "Выберите абонемент:",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
+    )
+
+
+@router.callback_query(F.data.startswith("ppl_paypick:"))
+async def cb_ppl_paypick(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    subscription_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    data = await state.get_data()
+    person_id = data.get("person_id")
+    if not person_id:
+        await query.answer("Ошибка", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        sub = await session.get(Subscription, subscription_id)
+        if sub is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        prompt = await _payin_amount_prompt(session, sub)
+    await query.answer()
+    await state.set_state(PayInFSM.amount)
+    await state.update_data(person_id=person_id, subscription_id=subscription_id)
+    if query.message:
+        await query.message.answer(prompt)
+
+
+@router.message(PayInFSM.amount, F.text)
+async def fsm_payin_amount(message: Message, state: FSMContext) -> None:
+    if message.from_user is None or message.text is None:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Внесение оплаты отменено.")
+        return
+    try:
+        amount = _parse_payment_amount(message.text)
+    except InvalidOperation:
+        await message.answer("Введите число.")
+        return
+    if amount <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+    data = await state.get_data()
+    person_id = data.get("person_id")
+    subscription_id = data.get("subscription_id")
+    if not person_id or not subscription_id:
+        await state.clear()
+        await message.answer("Ошибка")
+        return
+    today = datetime.now(school_tz()).date()
+    async with async_session_maker() as session:
+        admin = await _require_admin_message_strict(message, session)
+        if admin is None:
+            return
+        await record_payment(
+            session,
+            str(subscription_id),
+            amount,
+            today,
+            recorded_by_id=admin.id,
+        )
+        await session.commit()
+        text = await _format_person_payments(session, str(person_id))
+    await state.clear()
+    await message.answer(text, reply_markup=_payments_keyboard(str(person_id)))
 
 
 @router.callback_query(F.data.startswith("ppl_pair:"))
