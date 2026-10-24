@@ -665,7 +665,7 @@ async def cb_ppl_to_grp(query: CallbackQuery, state: FSMContext) -> None:
         return
     await query.answer()
     if query.message:
-        from .legacy import _prompt_assign_group
+        from .groups import _prompt_assign_group
 
         await _prompt_assign_group(query.message, state, person_id)
 
@@ -973,7 +973,7 @@ async def fsm_people_add_name(message: Message, state: FSMContext) -> None:
     if item is None or item.needs_fix or item.name_key is None:
         await message.answer("Фамилия и имя одной строкой.")
         return
-    from .legacy import _list_active_groups
+    from .groups import _list_active_groups
 
     async with async_session_maker() as session:
         groups = await _list_active_groups(session)
@@ -1032,7 +1032,7 @@ async def fsm_people_pick_waiting(message: Message, state: FSMContext) -> None:
                 return
         await message.answer(exc.message)
         return
-    from .legacy import _after_people_pick
+    from .groups import _after_people_pick
 
     await _after_people_pick(message, state, picked.id, purpose)
 
@@ -1256,7 +1256,7 @@ async def fsm_contact_role(message: Message, state: FSMContext) -> None:
 async def _build_rows_ppl_add(
     session: AsyncSession, data: dict[str, object]
 ) -> list[PickRow]:
-    from .legacy import _build_rows_active_groups
+    from .groups import _build_rows_active_groups
 
     return await _build_rows_active_groups(session, data)
 

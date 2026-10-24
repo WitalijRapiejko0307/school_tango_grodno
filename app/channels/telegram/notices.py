@@ -172,7 +172,7 @@ async def _persons_for_notice_pick(
 
 
 async def _send_notice_session_actions(message: Message, session_id: str) -> None:
-    from .legacy import _session_group_name
+    from .groups import _session_group_name
 
     async with async_session_maker() as session:
         school_session = await session.get(SchoolSession, session_id)
@@ -246,7 +246,7 @@ async def fsm_notice_when(message: Message, state: FSMContext) -> None:
 
 @router.message(NoticeFSM.move_place)
 async def fsm_notice_place(message: Message, state: FSMContext) -> None:
-    from .legacy import _session_group_name
+    from .groups import _session_group_name
 
     if message.text is None or message.from_user is None or message.bot is None:
         return
@@ -293,7 +293,7 @@ async def fsm_notice_place(message: Message, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("ntc_cancel:"))
 async def cb_notice_cancel(query: CallbackQuery) -> None:
-    from .legacy import _session_group_name
+    from .groups import _session_group_name
 
     if query.data is None or query.from_user is None or query.message is None or query.bot is None:
         return
@@ -323,7 +323,7 @@ async def cb_notice_cancel(query: CallbackQuery) -> None:
 
 @router.message(F.text == BTN_NOTICE)
 async def menu_notice(message: Message, state: FSMContext) -> None:
-    from .legacy import _list_active_groups
+    from .groups import _list_active_groups
 
     if await _admin_person(message) is None:
         await message.answer(REFUSAL)
@@ -483,7 +483,7 @@ async def cb_ppl_guests(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.message(GuestPickFSM.number, F.text.regexp(r"^\s*\d+\s*$"))
 async def fsm_guest_pick(message: Message, state: FSMContext) -> None:
-    from .legacy import _session_group_name
+    from .groups import _session_group_name
 
     if message.from_user is None or message.text is None:
         return
