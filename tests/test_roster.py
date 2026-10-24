@@ -5,10 +5,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db import Base
-from app.models import Attendance, GroupMembership, Person, SchoolSession
+from app.models import Attendance, BotChatMessage, GroupMembership, Person, SchoolSession
 from app.services.roster import (
     claim_person,
     confirm_roster,
+    delete_guest_shell,
     end_group_membership,
     find_unclaimed_by_query,
     name_key_from_parts,
@@ -216,6 +217,25 @@ async def test_end_group_membership_keeps_attendance(db_session: AsyncSession) -
         select(func.count()).select_from(Attendance)
     )
     assert attendance_count == 1
+
+
+async def test_delete_guest_shell_removes_fresh_guest(db_session: AsyncSession) -> None:
+    guest = Person(full_name="TG Guest", role="guest", telegram_user_id=7)
+    db_session.add(guest)
+    await db_session.flush()
+    db_session.add(
+        BotChatMessage(
+            person_id=guest.id,
+            chat_id=7,
+            telegram_message_id=1,
+        )
+    )
+    await db_session.flush()
+    guest_id = guest.id
+
+    await delete_guest_shell(db_session, guest)
+
+    assert await db_session.get(Person, guest_id) is None
 
 
 async def test_end_group_membership_none_without_active(db_session: AsyncSession) -> None:

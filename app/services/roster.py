@@ -4,10 +4,17 @@ import re
 from dataclasses import dataclass
 from datetime import date, datetime
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import GroupMembership, Person
+from app.models import (
+    BotChatMessage,
+    DayGather,
+    GroupMembership,
+    GuestRsvp,
+    Person,
+    Reminder,
+)
 from app.services.schedule import assign_group
 
 _PATRONYMIC_ENDINGS = ("вич", "вна", "ична", "овна")
@@ -307,6 +314,29 @@ async def end_group_membership(
     membership.ended_on = ended_on
     await session.flush()
     return membership
+
+
+async def delete_guest_shell(session: AsyncSession, guest: Person) -> None:
+    """Remove a just-created guest after their Telegram is linked to a real card.
+
+    A guest who already has school data is only unlinked, so that history stays.
+    """
+    if guest.role != "guest":
+        guest.telegram_user_id = None
+        guest.username = None
+        await session.flush()
+        return
+    membership = await _any_active_membership(session, guest.id)
+    if membership is not None:
+        guest.telegram_user_id = None
+        guest.username = None
+        await session.flush()
+        return
+    guest_id = guest.id
+    for model in (BotChatMessage, Reminder, GuestRsvp, DayGather):
+        await session.execute(delete(model).where(model.person_id == guest_id))
+    await session.delete(guest)
+    await session.flush()
 
 
 async def claim_person(

@@ -207,7 +207,8 @@ async def _list_all_people_pick_rows(session: AsyncSession) -> list[PickRow]:
     today = _today_local()
     rows: list[PickRow] = []
     for person in people:
-        detail = await _person_pick_detail(session, person, today)
+        unpaid = await person_has_unpaid_started(session, person.id, today)
+        detail = "не оплачен" if unpaid else ""
         rows.append(PickRow(id=person.id, full_name=person.full_name, detail=detail))
     return rows
 
@@ -366,7 +367,9 @@ async def _person_card_text(session: AsyncSession, person_id: str) -> str | None
     person = await session.get(Person, person_id)
     if person is None or person.archived_at is not None:
         return None
-    lines = [person.full_name]
+    membership = await _active_membership(session, person_id)
+    role_label = format_person_role_label(person.role, membership is not None)
+    lines = [f"{person.full_name} — {role_label}"]
     if person.phone:
         lines.append(f"Телефон: {person.phone}")
     detail = await _person_group_detail(session, person_id)
@@ -425,14 +428,16 @@ async def _prompt_leave_person(
     )
 
 
-def _people_pick_keyboard(rows: list[PickRow], page: int) -> InlineKeyboardMarkup | None:
-    if not has_next_page(rows, page):
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def _people_pick_keyboard(rows: list[PickRow], page: int) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    if has_next_page(rows, page):
+        buttons.append(
             [InlineKeyboardButton(text="Дальше", callback_data="pp_more")]
-        ]
+        )
+    buttons.append(
+        [InlineKeyboardButton(text="Отмена", callback_data="pp_cancel")]
     )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def _send_people_pick_page(
@@ -627,6 +632,16 @@ async def cb_people_leave(query: CallbackQuery, state: FSMContext) -> None:
             rows=rows,
             title="Удаление из группы по номеру.",
         )
+@router.callback_query(F.data == "pp_cancel")
+async def cb_people_pick_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer("Выбор отменён.")
+
+
 @router.callback_query(F.data == "pp_more")
 async def cb_people_pick_more(query: CallbackQuery, state: FSMContext) -> None:
     if await _require_admin_callback(query) is None:
@@ -1368,6 +1383,10 @@ async def fsm_people_pick_waiting(message: Message, state: FSMContext) -> None:
     async with async_session_maker() as session:
         if await _require_admin_message_strict(message, session) is None:
             return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Выбор отменён.")
+        return
     data = await state.get_data()
     pick_ids: list[str] = list(data.get("pick_ids") or [])
     purpose = str(data.get("pick_purpose") or "")

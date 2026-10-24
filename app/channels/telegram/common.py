@@ -399,19 +399,21 @@ def _list_pick_hint(purpose: str) -> str:
 
 def _list_pick_keyboard(
     rows: list[PickRow], page: int, purpose: str
-) -> InlineKeyboardMarkup | None:
-    if not has_next_page(rows, page):
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+) -> InlineKeyboardMarkup:
+    buttons: list[list[InlineKeyboardButton]] = []
+    if has_next_page(rows, page):
+        buttons.append(
             [
                 InlineKeyboardButton(
                     text="Дальше",
                     callback_data=_list_pick_more_callback(purpose),
                 )
             ]
-        ]
+        )
+    buttons.append(
+        [InlineKeyboardButton(text="Отмена", callback_data="pick_cancel")]
     )
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
 
 
 async def _send_list_pick_page(

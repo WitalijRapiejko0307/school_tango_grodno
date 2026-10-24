@@ -331,9 +331,9 @@ async def _enroll_claim_by_id(
         guest = await _person_by_telegram(session, telegram_user_id)
         try:
             if guest is not None and guest.id != person_id:
-                guest.telegram_user_id = None
-                guest.username = None
-                await session.flush()
+                from app.services.roster import delete_guest_shell
+
+                await delete_guest_shell(session, guest)
             person = await claim_person(
                 session,
                 person_id,
@@ -831,6 +831,16 @@ async def cb_list_pick_more(query: CallbackQuery, state: FSMContext) -> None:
         )
 
 
+@router.callback_query(F.data == "pick_cancel")
+async def cb_list_pick_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer("Выбор отменён.")
+
+
 
 
 # --- Reply menu handlers ---
@@ -968,6 +978,10 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         admin = await _require_admin_message_strict(message, session)
         if admin is None:
             return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Выбор отменён.")
+        return
     data = await state.get_data()
     purpose = str(data.get("pick_purpose") or "")
     async with async_session_maker() as session:

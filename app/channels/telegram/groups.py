@@ -1392,7 +1392,28 @@ async def cb_grp_roster_view(query: CallbackQuery, state: FSMContext) -> None:
     )
     await query.answer()
     if query.message:
-        await query.message.answer("Номер откроет карточку.")
+        await query.message.answer(
+            "Номер откроет карточку.",
+            reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="Отмена", callback_data="grp_roster_view_cancel"
+                        )
+                    ]
+                ]
+            ),
+        )
+
+
+@router.callback_query(F.data == "grp_roster_view_cancel")
+async def cb_grp_roster_view_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer("Выбор отменён.")
 
 
 @router.callback_query(F.data.startswith("grp_stream:"))
@@ -1961,6 +1982,10 @@ async def fsm_roster_text(message: Message, state: FSMContext) -> None:
 
     data = await state.get_data()
     if data.get("roster_mode") == "view":
+        if text.casefold() == "отмена":
+            await state.clear()
+            await message.answer("Выбор отменён.")
+            return
         view_ids = list(data.get("roster_view_ids") or [])
         if not text.isdigit():
             await message.answer("Введите номер из списка.")
