@@ -5,6 +5,7 @@ from __future__ import annotations
 from datetime import UTC, datetime
 
 from aiogram import F, Router
+from aiogram.dispatcher.event.bases import SkipHandler
 from aiogram.types import CallbackQuery, Message
 from app.db import async_session_maker
 from app.models import DayGather, DayGatherResponse
@@ -59,16 +60,16 @@ async def gather_numeric_reply(message: Message) -> None:
         return
     indexes = parse_gather_indexes(message.text)
     if indexes is None:
-        return
+        raise SkipHandler()
     now = datetime.now(UTC)
     gather_date = local_school_date(now)
     async with async_session_maker() as session:
         person = await _person_by_telegram(session, message.from_user.id)
         if person is None:
-            return
+            raise SkipHandler()
         day_gather = await find_pending_day_gather(session, person.id, gather_date)
         if day_gather is None:
-            return
+            raise SkipHandler()
         ok, reply_text = await apply_gather_selection(
             session, day_gather, indexes, now
         )
