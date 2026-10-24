@@ -13,7 +13,6 @@ from zoneinfo import ZoneInfo
 from aiogram import BaseMiddleware, Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -25,6 +24,33 @@ from aiogram.types import (
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from .states import (
+    AdminInviteFSM,
+    AdminMenuFSM,
+    AssignGroupFSM,
+    ContactEditFSM,
+    ContactFSM,
+    DropInProductFSM,
+    EnrollFSM,
+    GroupRenameFSM,
+    GroupStreamFSM,
+    GuestPickFSM,
+    ListPickFSM,
+    NewGroupFSM,
+    NewPriceFSM,
+    NoticeFSM,
+    OpenSubFSM,
+    PeopleAddFSM,
+    PeoplePickFSM,
+    ProductEditFSM,
+    RosterFSM,
+    SlotFSM,
+    SubProductFSM,
+    WeekFSM,
+)
+
+# Referenced only for `from .legacy import *` (no handlers in this module yet).
+_REEXPORT_ONLY_FSM = (AdminMenuFSM, AssignGroupFSM, SlotFSM)
 from app.config import get_settings
 from app.db import async_session_maker
 from app.models import (
@@ -1749,128 +1775,6 @@ async def _client_mark_yes(
         session, person_id, school_session_id, "client", marked_by_id=person_id
     )
     return "Отметили по вашему ответу."
-
-
-# --- FSM ---
-
-
-class AdminInviteFSM(StatesGroup):
-    waiting_identifier = State()
-
-
-class ContactFSM(StatesGroup):
-    name = State()
-    phone = State()
-    role_label = State()
-
-
-class ContactEditFSM(StatesGroup):
-    name = State()
-    phone = State()
-    role_label = State()
-
-
-class NewGroupFSM(StatesGroup):
-    name = State()
-    new_stream_name = State()
-
-
-class GroupStreamFSM(StatesGroup):
-    new_stream_name = State()
-
-
-class SlotFSM(StatesGroup):
-    group_id = State()
-    date_str = State()
-    time_str = State()
-    duration = State()
-    place = State()
-    bring_notes = State()
-
-
-class GuestPickFSM(StatesGroup):
-    number = State()
-
-
-class WeekFSM(StatesGroup):
-    time_str = State()
-    duration = State()
-    place = State()
-    notes = State()
-    once_date = State()
-
-
-class AssignGroupFSM(StatesGroup):
-    person_id = State()
-    group_id = State()
-
-
-class SubProductFSM(StatesGroup):
-    name = State()
-    audience = State()
-    lessons = State()
-    validity = State()
-    price = State()
-
-
-class DropInProductFSM(StatesGroup):
-    name = State()
-    price = State()
-
-
-class OpenSubFSM(StatesGroup):
-    person_id = State()
-    product_id = State()
-
-
-class NewPriceFSM(StatesGroup):
-    product_id = State()
-    amount = State()
-    valid_from = State()
-
-
-class ProductEditFSM(StatesGroup):
-    name = State()
-    audience = State()
-    lessons = State()
-    validity = State()
-
-
-class AdminMenuFSM(StatesGroup):
-    choosing = State()
-
-
-class RosterFSM(StatesGroup):
-    active = State()
-
-
-class PeoplePickFSM(StatesGroup):
-    waiting = State()
-    card_name = State()
-    card_phone = State()
-
-
-class PeopleAddFSM(StatesGroup):
-    name = State()
-
-
-class ListPickFSM(StatesGroup):
-    waiting = State()
-    notice_text = State()
-
-
-class EnrollFSM(StatesGroup):
-    waiting_name = State()
-
-
-class NoticeFSM(StatesGroup):
-    move_when = State()
-    move_place = State()
-    text = State()
-
-
-class GroupRenameFSM(StatesGroup):
-    waiting_name = State()
 
 
 _ROSTER_DELETE_RE = re.compile(r"^\s*удалить\s+(\d+)\s*$", re.IGNORECASE)
