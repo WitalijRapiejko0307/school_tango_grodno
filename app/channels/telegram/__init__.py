@@ -1,6 +1,7 @@
-from .legacy import *  # noqa: F401,F403
-from .legacy import (
-    router,
+from aiogram import Router
+
+from .billing import router as _billing_router
+from .legacy import (  # noqa: F401
     send_due_reminder,
     async_session_maker,
     cb_once_cancel,
@@ -12,3 +13,10 @@ from .legacy import (
     _apply_roster_replacements,
     _parse_lines_to_draft_dicts,
 )
+from .legacy import router as _legacy_router
+
+from .legacy import *  # noqa: F401,F403
+
+router = Router(name="telegram")
+router.include_router(_billing_router)
+router.include_router(_legacy_router)
