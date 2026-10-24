@@ -181,7 +181,6 @@ BTN_GROUPS = "Группы"
 BTN_PEOPLE = "Люди"
 BTN_PRICE = "Прайс"
 BTN_REMINDERS = "Напоминания"
-BTN_ROSTER = "Состав"
 BTN_NOTICE = "Сообщение"
 BTN_MY_GROUP = "Моя группа"
 BTN_OTHER_GROUP = "Не со своей группой"
@@ -195,7 +194,6 @@ ADMIN_MENU = [
     BTN_PEOPLE,
     BTN_PRICE,
     BTN_REMINDERS,
-    BTN_ROSTER,
     BTN_NOTICE,
 ]
 CLIENT_MENU = [BTN_PRICE, BTN_MY_GROUP, BTN_OTHER_GROUP, BTN_BALANCE]
@@ -687,12 +685,6 @@ async def _on_index_pick_grp_slot(
     )
 
 
-async def _on_index_pick_grp_roster(
-    message: Message, state: FSMContext, picked: list[PickRow]
-) -> None:
-    await _begin_roster_group(message, state, picked[0].id)
-
-
 async def _on_index_pick_grp_stream(
     message: Message, state: FSMContext, picked: list[PickRow]
 ) -> None:
@@ -848,11 +840,6 @@ REGISTRY: dict[str, PickSpec] = {
         is_index_pick=True,
         build_rows=_build_rows_active_groups,
         on_index_pick=_on_index_pick_grp_slot,
-    ),
-    "grp_roster": PickSpec(
-        is_index_pick=True,
-        build_rows=_build_rows_active_groups,
-        on_index_pick=_on_index_pick_grp_roster,
     ),
     "grp_stream": PickSpec(
         is_index_pick=True,
@@ -1577,11 +1564,15 @@ async def _apply_ppl_add_choice(
     await message.answer(f"Добавлен(а) {report_name} в группу «{group_name}».")
 
 
+async def _begin_roster_group_state(state: FSMContext, group_id: str) -> None:
+    await state.set_state(RosterFSM.active)
+    await state.update_data(group_id=group_id, drafts=[])
+
+
 async def _begin_roster_group(
     message: Message, state: FSMContext, group_id: str
 ) -> None:
-    await state.set_state(RosterFSM.active)
-    await state.update_data(group_id=group_id, drafts=[])
+    await _begin_roster_group_state(state, group_id)
     await message.answer(
         "Пришлите строки состава (по одному человеку на строку) или фото списка."
     )
@@ -3737,6 +3728,11 @@ def _group_card_keyboard(group_id: str) -> InlineKeyboardMarkup:
             ],
             [
                 InlineKeyboardButton(
+                    text="Состав", callback_data=f"grp_roster:{group_id}"
+                ),
+            ],
+            [
+                InlineKeyboardButton(
                     text="Задать поток", callback_data=f"grp_stream:{group_id}"
                 ),
             ],
@@ -3839,6 +3835,38 @@ async def cb_grp_card(query: CallbackQuery) -> None:
     await query.answer()
     if query.message:
         await _send_group_card(query.message, group_id)
+
+
+@router.callback_query(F.data.startswith("grp_roster:"))
+async def cb_grp_roster(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        name = group.name
+        members = await group_audience(session, group_id)
+    await query.answer()
+    if query.message is None:
+        return
+    if members:
+        lines = [f"Состав группы «{name}»:"] + [
+            f"{i}. {p.full_name}" for i, p in enumerate(members, start=1)
+        ]
+    else:
+        lines = [f"Состав группы «{name}»: пока никого нет."]
+    lines.append("")
+    lines.append(
+        "Пришлите строки состава (по одному человеку на строку) или фото списка, "
+        "чтобы добавить."
+    )
+    await query.message.answer("\n".join(lines))
+    await _begin_roster_group_state(state, group_id)
 
 
 @router.callback_query(F.data.startswith("grp_stream:"))
@@ -4511,34 +4539,6 @@ async def cb_ppl_guests(query: CallbackQuery, state: FSMContext) -> None:
     )
 
 
-@router.message(F.text == BTN_ROSTER)
-async def menu_roster(message: Message, state: FSMContext) -> None:
-    async with async_session_maker() as session:
-        if await _require_admin_message(message, session) is None:
-            return
-        groups = await _list_active_groups(session)
-    await state.clear()
-    if not groups:
-        await state.set_state(RosterFSM.active)
-        await state.update_data(group_id=None, drafts=[])
-        await message.answer(
-            "Выберите группу для состава или напишите название новой группы."
-        )
-        return
-    pick_rows = [PickRow(id=g.id, full_name=g.name) for g in groups]
-    await _start_list_pick(
-        message,
-        state,
-        purpose="grp_roster",
-        rows=pick_rows,
-        title=(
-            "Номер выберет группу.\n\n"
-            "Или напишите название новой группы."
-        ),
-        hint=HINT_INDEX,
-    )
-
-
 async def _apply_roster_image(
     message: Message, state: FSMContext, image_bytes: bytes, mime: str
 ) -> None:
@@ -5141,21 +5141,6 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         if purpose == "ppl_add" and not message.text.strip().isdigit():
             await message.answer(HINT_INDEX)
             return
-        if purpose == "grp_roster":
-            text = message.text.strip()
-            if not text.isdigit():
-                async with async_session_maker() as session:
-                    group = await create_group(session, text)
-                    await session.commit()
-                    group_id = group.id
-                await state.set_state(RosterFSM.active)
-                await state.update_data(group_id=group_id, drafts=[])
-                await message.answer(
-                    f"Группа «{text}» создана.\n"
-                    "Пришлите строки состава (по одному человеку на строку) "
-                    "или фото списка."
-                )
-                return
         try:
             picked = resolve_picks(rows, message.text, many=False)
         except PickError as exc:
