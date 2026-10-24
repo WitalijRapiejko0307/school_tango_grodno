@@ -35,7 +35,7 @@ async def telegram_db(monkeypatch: pytest.MonkeyPatch):
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
     factory = async_sessionmaker(engine, class_=AsyncSession, expire_on_commit=False)
-    monkeypatch.setattr("app.channels.telegram.async_session_maker", factory)
+    monkeypatch.setattr("app.channels.telegram.legacy.async_session_maker", factory)
     yield factory
     await engine.dispose()
 
