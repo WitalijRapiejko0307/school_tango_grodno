@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import date, datetime
 from zoneinfo import ZoneInfo
 
 from aiogram import BaseMiddleware, Bot
+from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -26,7 +29,16 @@ from app.services.bot_messages import track_user_message
 from app.services.identity import upsert_from_telegram
 from app.services.notices import countable, delivery_report
 from app.services.notifications import DueReminder
+from app.services.pick_list import (
+    HINT_INDEX,
+    HINT_MANY,
+    PickRow,
+    has_next_page,
+    page_text,
+)
 from app.services.schedule import WEEKDAY_LABELS
+
+from .states import ListPickFSM
 
 logger = logging.getLogger(__name__)
 
@@ -319,3 +331,128 @@ def reminder_reply_keyboard(item: DueReminder) -> ReplyKeyboardMarkup | None:
     if item.kind == "session_start" and item.person_role == "client":
         return reply_markup_for_role("client")
     return None
+
+
+# --- Generic list pick infrastructure ---
+
+
+def _pick_ids_from_data(data: dict[str, object]) -> list[str]:
+    return list(data.get("pick_ids") or [])  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class PickSpec:
+    is_index_pick: bool
+    build_rows: Callable[[AsyncSession, dict[str, object]], Awaitable[list[PickRow]]]
+    on_index_pick: (
+        Callable[[Message, FSMContext, list[PickRow]], Awaitable[None]] | None
+    ) = None
+    on_many_pick: (
+        Callable[[Message, FSMContext, list[PickRow], Person], Awaitable[None]] | None
+    ) = None
+    notice_recipient: (
+        Callable[[AsyncSession, PickRow], Awaitable[Person | None]] | None
+    ) = None
+    is_notice_multi: bool = False
+    more_callback: str | None = None
+
+
+REGISTRY: dict[str, PickSpec] = {}
+
+
+def register_pick_spec(purpose: str, spec: PickSpec) -> None:
+    REGISTRY[purpose] = spec
+
+
+_att_prefix_pick_spec: PickSpec | None = None
+
+
+def register_att_pick_spec(spec: PickSpec) -> None:
+    global _att_prefix_pick_spec
+    _att_prefix_pick_spec = spec
+
+
+def _get_pick_spec(purpose: str) -> PickSpec | None:
+    if purpose.startswith("att:"):
+        return _att_prefix_pick_spec
+    return REGISTRY.get(purpose)
+
+
+def _list_pick_more_callback(purpose: str) -> str:
+    spec = _get_pick_spec(purpose)
+    if spec is not None:
+        if spec.more_callback is not None:
+            return spec.more_callback
+        if spec.is_index_pick:
+            return f"{purpose}_more"
+    return "msg_more"
+
+
+def _list_pick_hint(purpose: str) -> str:
+    spec = _get_pick_spec(purpose)
+    if spec is not None:
+        return HINT_INDEX if spec.is_index_pick else HINT_MANY
+    return HINT_MANY
+
+
+def _list_pick_keyboard(
+    rows: list[PickRow], page: int, purpose: str
+) -> InlineKeyboardMarkup | None:
+    if not has_next_page(rows, page):
+        return None
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Дальше",
+                    callback_data=_list_pick_more_callback(purpose),
+                )
+            ]
+        ]
+    )
+
+
+async def _send_list_pick_page(
+    message: Message,
+    rows: list[PickRow],
+    page: int,
+    *,
+    hint: str,
+    title: str | None = None,
+    purpose: str,
+) -> None:
+    body = page_text(rows, page, hint)
+    text = f"{title}\n\n{body}" if title else body
+    await message.answer(
+        text, reply_markup=_list_pick_keyboard(rows, page, purpose)
+    )
+
+
+async def _start_list_pick(
+    message: Message,
+    state: FSMContext,
+    *,
+    purpose: str,
+    rows: list[PickRow],
+    title: str | None = None,
+    hint: str = HINT_MANY,
+) -> None:
+    await state.set_state(ListPickFSM.waiting)
+    await state.update_data(
+        pick_ids=[row.id for row in rows],
+        pick_page=0,
+        pick_purpose=purpose,
+    )
+    await _send_list_pick_page(
+        message, rows, 0, hint=hint, title=title, purpose=purpose
+    )
+
+
+async def _list_pick_rows_from_data(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    purpose = str(data.get("pick_purpose") or "")
+    spec = _get_pick_spec(purpose)
+    if spec is None:
+        return []
+    return await spec.build_rows(session, data)

@@ -4,8 +4,6 @@ from __future__ import annotations
 
 import logging
 import re
-from collections.abc import Awaitable, Callable
-from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from aiogram import Bot, F, Router
@@ -191,9 +189,19 @@ from .common import (  # noqa: E402
     _require_admin_message,
     _require_admin_message_strict,
     _school_tz,
+    _get_pick_spec,
+    _list_pick_hint,
+    _list_pick_keyboard,
+    _list_pick_more_callback,
+    _list_pick_rows_from_data,
+    _pick_ids_from_data,
     _send_notice,
+    _start_list_pick,
     _today_local,
     _weekday_keyboard,
+    PickSpec,
+    register_att_pick_spec,
+    register_pick_spec,
     reminder_inline_markup,
     reminder_reply_keyboard,
     reply_markup_for_role,
@@ -313,27 +321,6 @@ def _attendance_pick_rows(
             detail = "не отмечен"
         rows.append(PickRow(id=person.id, full_name=person.full_name, detail=detail))
     return rows
-
-
-def _pick_ids_from_data(data: dict[str, object]) -> list[str]:
-    return list(data.get("pick_ids") or [])  # type: ignore[arg-type]
-
-
-@dataclass(frozen=True)
-class PickSpec:
-    is_index_pick: bool
-    build_rows: Callable[[AsyncSession, dict[str, object]], Awaitable[list[PickRow]]]
-    on_index_pick: (
-        Callable[[Message, FSMContext, list[PickRow]], Awaitable[None]] | None
-    ) = None
-    on_many_pick: (
-        Callable[[Message, FSMContext, list[PickRow], Person], Awaitable[None]] | None
-    ) = None
-    notice_recipient: (
-        Callable[[AsyncSession, PickRow], Awaitable[Person | None]] | None
-    ) = None
-    is_notice_multi: bool = False
-    more_callback: str | None = None
 
 
 async def _build_rows_grp(
@@ -640,84 +627,124 @@ async def _on_many_pick_att(
     await message.answer(attendance_report(report_lines))
 
 
-REGISTRY: dict[str, PickSpec] = {
-    "grp": PickSpec(
+register_pick_spec(
+    "grp",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_grp,
         on_index_pick=_on_index_pick_grp,
     ),
-    "prd": PickSpec(
+)
+register_pick_spec(
+    "prd",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_prd,
         on_index_pick=_on_index_pick_prd,
     ),
-    "today": PickSpec(
+)
+register_pick_spec(
+    "today",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_school_sessions,
         on_index_pick=_on_index_pick_today,
     ),
-    "sess": PickSpec(
+)
+register_pick_spec(
+    "sess",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_school_sessions,
         on_index_pick=_on_index_pick_sess,
     ),
-    "slot_week": PickSpec(
+)
+register_pick_spec(
+    "slot_week",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_weekly_slots,
         on_index_pick=_on_index_pick_slot_week,
     ),
-    "slot_once": PickSpec(
+)
+register_pick_spec(
+    "slot_once",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_weekly_slots,
         on_index_pick=_on_index_pick_slot_once,
     ),
-    "grp_slot": PickSpec(
+)
+register_pick_spec(
+    "grp_slot",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_active_groups,
         on_index_pick=_on_index_pick_grp_slot,
     ),
-    "grp_stream": PickSpec(
+)
+register_pick_spec(
+    "grp_stream",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_active_groups,
         on_index_pick=_on_index_pick_grp_stream,
     ),
-    "grp_assign": PickSpec(
+)
+register_pick_spec(
+    "grp_assign",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_active_groups,
         on_index_pick=_on_index_pick_grp_assign,
     ),
-    "ppl_add": PickSpec(
+)
+register_pick_spec(
+    "ppl_add",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_active_groups,
         on_index_pick=_on_index_pick_ppl_add,
     ),
-    "sub_partner": PickSpec(
+)
+register_pick_spec(
+    "sub_partner",
+    PickSpec(
         is_index_pick=True,
         build_rows=_build_rows_msg,
         on_index_pick=_on_index_pick_sub_partner,
     ),
-    "msg": PickSpec(
+)
+register_pick_spec(
+    "msg",
+    PickSpec(
         is_index_pick=False,
         build_rows=_build_rows_msg,
         is_notice_multi=True,
         notice_recipient=_notice_recipient_msg,
         on_many_pick=_on_many_pick_notice,
     ),
-    "guests": PickSpec(
+)
+register_pick_spec(
+    "guests",
+    PickSpec(
         is_index_pick=False,
         build_rows=_build_rows_guests,
         is_notice_multi=True,
         notice_recipient=_notice_recipient_guests,
         on_many_pick=_on_many_pick_notice,
     ),
-    "reminders": PickSpec(
+)
+register_pick_spec(
+    "reminders",
+    PickSpec(
         is_index_pick=False,
         build_rows=_build_rows_reminders,
         is_notice_multi=True,
         notice_recipient=_notice_recipient_reminders,
         on_many_pick=_on_many_pick_notice,
     ),
-}
+)
 
 _ATT_PICK_SPEC = PickSpec(
     is_index_pick=False,
@@ -725,90 +752,7 @@ _ATT_PICK_SPEC = PickSpec(
     build_rows=_build_rows_att,
     on_many_pick=_on_many_pick_att,
 )
-
-
-def _get_pick_spec(purpose: str) -> PickSpec | None:
-    if purpose.startswith("att:"):
-        return _ATT_PICK_SPEC
-    return REGISTRY.get(purpose)
-
-
-def _list_pick_more_callback(purpose: str) -> str:
-    spec = _get_pick_spec(purpose)
-    if spec is not None:
-        if spec.more_callback is not None:
-            return spec.more_callback
-        if spec.is_index_pick:
-            return f"{purpose}_more"
-    return "msg_more"
-
-
-def _list_pick_hint(purpose: str) -> str:
-    spec = _get_pick_spec(purpose)
-    if spec is not None:
-        return HINT_INDEX if spec.is_index_pick else HINT_MANY
-    return HINT_MANY
-
-
-def _list_pick_keyboard(rows: list[PickRow], page: int, purpose: str) -> InlineKeyboardMarkup | None:
-    if not has_next_page(rows, page):
-        return None
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Дальше",
-                    callback_data=_list_pick_more_callback(purpose),
-                )
-            ]
-        ]
-    )
-
-
-async def _send_list_pick_page(
-    message: Message,
-    rows: list[PickRow],
-    page: int,
-    *,
-    hint: str,
-    title: str | None = None,
-    purpose: str,
-) -> None:
-    body = page_text(rows, page, hint)
-    text = f"{title}\n\n{body}" if title else body
-    await message.answer(
-        text, reply_markup=_list_pick_keyboard(rows, page, purpose)
-    )
-
-
-async def _start_list_pick(
-    message: Message,
-    state: FSMContext,
-    *,
-    purpose: str,
-    rows: list[PickRow],
-    title: str | None = None,
-    hint: str = HINT_MANY,
-) -> None:
-    await state.set_state(ListPickFSM.waiting)
-    await state.update_data(
-        pick_ids=[row.id for row in rows],
-        pick_page=0,
-        pick_purpose=purpose,
-    )
-    await _send_list_pick_page(
-        message, rows, 0, hint=hint, title=title, purpose=purpose
-    )
-
-
-async def _list_pick_rows_from_data(
-    session: AsyncSession, data: dict[str, object]
-) -> list[PickRow]:
-    purpose = str(data.get("pick_purpose") or "")
-    spec = _get_pick_spec(purpose)
-    if spec is None:
-        return []
-    return await spec.build_rows(session, data)
+register_att_pick_spec(_ATT_PICK_SPEC)
 
 
 async def _persons_for_notice_pick(
