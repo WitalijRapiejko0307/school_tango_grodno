@@ -8,18 +8,14 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from zoneinfo import ZoneInfo
-
-from aiogram import BaseMiddleware, Bot, F, Router
+from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    KeyboardButton,
     Message,
-    ReplyKeyboardMarkup,
 )
 from sqlalchemy import and_, select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -51,7 +47,6 @@ from .states import (
 
 # Referenced only for `from .legacy import *` (no handlers in this module yet).
 _REEXPORT_ONLY_FSM = (AdminMenuFSM, AssignGroupFSM, SlotFSM)
-from app.config import get_settings
 from app.db import async_session_maker
 from app.models import (
     Attendance,
@@ -93,13 +88,10 @@ from app.services.identity import (
 from app.services.bot_messages import (
     bind_outbound_school_session_id,
     reset_outbound_context,
-    track_user_message,
 )
 from app.services.notices import (
     cancel_notice_text,
     cancel_session,
-    countable,
-    delivery_report,
     free_notice_text,
     group_audience,
     notice_audience,
@@ -172,234 +164,51 @@ logger = logging.getLogger(__name__)
 
 router = Router(name="telegram")
 
-
-class _TrackUserMessageMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        try:
-            return await handler(event, data)
-        finally:
-            if (
-                isinstance(event, Message)
-                and event.from_user is not None
-                and not event.from_user.is_bot
-                and event.bot is not None
-            ):
-                try:
-                    await track_user_message(
-                        event.bot, event.chat.id, event.message_id
-                    )
-                except Exception:
-                    logger.exception(
-                        "Failed to track user message %s in chat %s",
-                        event.message_id,
-                        event.chat.id,
-                    )
-
-
-router.message.middleware(_TrackUserMessageMiddleware())
-
-ARCHIVED_ACCESS_CLOSED = "Доступ закрыт."
-
-# --- Menu labels (variant A) ---
-
-BTN_TODAY = "Сегодня"
-BTN_GROUPS = "Группы"
-BTN_PEOPLE = "Люди"
-BTN_PRICE = "Прайс"
-BTN_REMINDERS = "Напоминания"
-BTN_NOTICE = "Сообщение"
-BTN_MY_GROUP = "Моя группа"
-BTN_OTHER_GROUP = "Не со своей группой"
-BTN_BALANCE = "Остаток"
-BTN_SCHEDULE = "Расписание"
-BTN_CONTACTS = "Контакты"
-
-ADMIN_MENU = [
-    BTN_TODAY,
+from .common import (  # noqa: E402
+    ARCHIVED_ACCESS_CLOSED,
+    BTN_BALANCE,
+    BTN_CONTACTS,
     BTN_GROUPS,
+    BTN_MY_GROUP,
+    BTN_NOTICE,
+    BTN_OTHER_GROUP,
     BTN_PEOPLE,
     BTN_PRICE,
     BTN_REMINDERS,
-    BTN_NOTICE,
-]
-CLIENT_MENU = [BTN_PRICE, BTN_MY_GROUP, BTN_OTHER_GROUP, BTN_BALANCE]
-GUEST_MENU = [BTN_SCHEDULE, BTN_CONTACTS]
+    BTN_SCHEDULE,
+    BTN_TODAY,
+    REFUSAL,
+    _BlockArchivedMiddleware,
+    _TrackUserMessageMiddleware,
+    _admin_person,
+    _ensure_person,
+    _guest_keyboard_with_phone,
+    _is_admin,
+    _parse_hhmm,
+    _parse_school_slot,
+    _person_by_telegram,
+    _require_admin_callback,
+    _require_admin_message,
+    _require_admin_message_strict,
+    _school_tz,
+    _send_notice,
+    _today_local,
+    _weekday_keyboard,
+    reminder_inline_markup,
+    reminder_reply_keyboard,
+    reply_markup_for_role,
+    role_keyboard,
+)
+_REEXPORT_FROM_COMMON = (
+    reminder_inline_markup,
+    reminder_reply_keyboard,
+    reply_markup_for_role,
+    role_keyboard,
+)
 
-REFUSAL = "Эта команда доступна только администраторам."
-
-
-def role_keyboard(role: str) -> list[str]:
-    """Flat list of reply-keyboard button texts for the role."""
-    if role == "admin":
-        return list(ADMIN_MENU)
-    if role == "client":
-        return list(CLIENT_MENU)
-    return list(GUEST_MENU)
-
-
-BTN_SHARE_PHONE = "Подтвердить телефон"
-
-
-def _guest_keyboard_with_phone() -> ReplyKeyboardMarkup:
-    return ReplyKeyboardMarkup(
-        keyboard=[
-            [KeyboardButton(text=BTN_SHARE_PHONE, request_contact=True)],
-            [KeyboardButton(text=BTN_SCHEDULE), KeyboardButton(text=BTN_CONTACTS)],
-        ],
-        resize_keyboard=True,
-    )
-
-
-def reply_markup_for_role(role: str) -> ReplyKeyboardMarkup:
-    texts = role_keyboard(role)
-    if role in ("admin", "client"):
-        rows = [
-            [KeyboardButton(text=t) for t in texts[i : i + 2]]
-            for i in range(0, len(texts), 2)
-        ]
-    else:
-        rows = [[KeyboardButton(text=t) for t in texts]]
-    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True)
-
-
-def _weekday_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text=WEEKDAY_LABELS[i], callback_data=f"{prefix}:{i}")
-                for i in range(0, 4)
-            ],
-            [
-                InlineKeyboardButton(text=WEEKDAY_LABELS[i], callback_data=f"{prefix}:{i}")
-                for i in range(4, 7)
-            ],
-        ]
-    )
-
-
-def _parse_hhmm(text: str) -> tuple[int, int] | None:
-    if not re.match(r"^\d{1,2}:\d{2}$", text.strip()):
-        return None
-    hour, minute = map(int, text.strip().split(":"))
-    if hour > 23 or minute > 59:
-        return None
-    return hour, minute
-
-
-def _school_tz() -> ZoneInfo:
-    return ZoneInfo(get_settings().SCHOOL_TZ)
-
-
-def _today_local() -> date:
-    return datetime.now(_school_tz()).date()
-
-
-async def _person_by_telegram(
-    session: AsyncSession, telegram_user_id: int
-) -> Person | None:
-    result = await session.execute(
-        select(Person).where(Person.telegram_user_id == telegram_user_id)
-    )
-    return result.scalar_one_or_none()
-
-
-class _BlockArchivedMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        from_user = None
-        if isinstance(event, Message) and event.from_user is not None:
-            from_user = event.from_user
-        elif isinstance(event, CallbackQuery) and event.from_user is not None:
-            from_user = event.from_user
-        if from_user is not None and not from_user.is_bot:
-            async with async_session_maker() as session:
-                person = await _person_by_telegram(session, from_user.id)
-            if (
-                person is not None
-                and person.archived_at is not None
-                and person.role != "admin"
-            ):
-                if isinstance(event, Message) and event.text:
-                    if event.text.split(maxsplit=1)[0] == "/start":
-                        return await handler(event, data)
-                if isinstance(event, Message):
-                    await event.answer(ARCHIVED_ACCESS_CLOSED)
-                elif isinstance(event, CallbackQuery):
-                    await event.answer(ARCHIVED_ACCESS_CLOSED, show_alert=True)
-                return None
-        return await handler(event, data)
-
-
+router.message.middleware(_TrackUserMessageMiddleware())
 router.message.middleware(_BlockArchivedMiddleware())
 router.callback_query.middleware(_BlockArchivedMiddleware())
-
-
-async def _ensure_person(message: Message) -> Person | None:
-    if message.from_user is None:
-        return None
-    async with async_session_maker() as session:
-        person = await upsert_from_telegram(
-            session,
-            telegram_user_id=message.from_user.id,
-            username=message.from_user.username,
-            full_name=message.from_user.full_name or "User",
-        )
-        await session.commit()
-        return person
-
-
-async def _person_for_callback(query: CallbackQuery) -> Person | None:
-    if query.from_user is None:
-        return None
-    async with async_session_maker() as session:
-        person = await _person_by_telegram(session, query.from_user.id)
-        await session.commit()
-        return person
-
-
-def _is_admin(person: Person) -> bool:
-    return person.role == "admin"
-
-
-async def _require_admin_message(
-    message: Message, session: AsyncSession
-) -> Person | None:
-    if message.from_user is None:
-        await message.answer("")
-        return None
-    person = await _person_by_telegram(session, message.from_user.id)
-    if person is None or not _is_admin(person):
-        await message.answer(REFUSAL if person and not _is_admin(person) else "")
-        return None
-    return person
-
-
-async def _require_admin_message_strict(
-    message: Message, session: AsyncSession
-) -> Person | None:
-    if message.from_user is None:
-        await message.answer(REFUSAL)
-        return None
-    person = await _person_by_telegram(session, message.from_user.id)
-    if person is None or not _is_admin(person):
-        await message.answer(REFUSAL)
-        return None
-    return person
-
-
-async def _require_admin_callback(
-    query: CallbackQuery, session: AsyncSession | None = None
-) -> Person | None:
-    if query.from_user is None:
-        await query.answer(REFUSAL, show_alert=True)
-        return None
-    if session is None:
-        person = await _person_for_callback(query)
-    else:
-        person = await _person_by_telegram(session, query.from_user.id)
-    if person is None or not _is_admin(person):
-        await query.answer(REFUSAL, show_alert=True)
-        return None
-    return person
 
 
 async def _list_today_sessions(session: AsyncSession, day: date) -> list[SchoolSession]:
@@ -4570,44 +4379,6 @@ async def fsm_roster_text(message: Message, state: FSMContext) -> None:
     await message.answer(_format_roster_preview(drafts))
 
 
-def _parse_school_slot(text: str) -> datetime | None:
-    try:
-        parsed = datetime.strptime(text.strip(), "%d.%m.%Y %H:%M")
-    except ValueError:
-        return None
-    return parsed.replace(tzinfo=ZoneInfo(get_settings().SCHOOL_TZ))
-
-
-async def _send_notice(
-    bot: Bot, people: list[Person], text: str
-) -> tuple[str, list[str], list[str]]:
-    reachable, _missing = countable(people)
-    delivered_names: list[str] = []
-    failed_names: list[str] = [
-        person.full_name for person in people if person.telegram_user_id is None
-    ]
-    for person in reachable:
-        try:
-            await bot.send_message(person.telegram_user_id, text)  # type: ignore[arg-type]
-            delivered_names.append(person.full_name)
-        except Exception:
-            logger.exception("Notice failed for %s", person.id)
-            failed_names.append(person.full_name)
-    delivered = len(delivered_names)
-    failed_count = len(people) - delivered
-    return delivery_report(delivered, failed_count), delivered_names, failed_names
-
-
-async def _admin_person(message: Message) -> Person | None:
-    if message.from_user is None:
-        return None
-    async with async_session_maker() as session:
-        person = await _person_by_telegram(session, message.from_user.id)
-        if person is None or not _is_admin(person):
-            return None
-        return person
-
-
 async def _send_notice_session_actions(message: Message, session_id: str) -> None:
     async with async_session_maker() as session:
         school_session = await session.get(SchoolSession, session_id)
@@ -5938,37 +5709,6 @@ async def fsm_new_price_valid_from(message: Message, state: FSMContext) -> None:
         await session.commit()
     await message.answer("Цена сохранена.")
     await state.clear()
-
-
-def reminder_inline_markup(item: DueReminder) -> InlineKeyboardMarkup | None:
-    if item.kind in ("attendance_ask", "attendance_nudge") and item.school_session_id:
-        sid = item.school_session_id
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Да", callback_data=f"att:{sid}:yes"),
-                    InlineKeyboardButton(text="Нет", callback_data=f"att:{sid}:no"),
-                ]
-            ]
-        )
-    if item.kind in ("session_start", "guest_day_of") and item.school_session_id:
-        sid = item.school_session_id
-        return InlineKeyboardMarkup(
-            inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="Иду", callback_data=f"go:{sid}"),
-                    InlineKeyboardButton(text="Не иду", callback_data=f"nogo:{sid}"),
-                ]
-            ]
-        )
-    return None
-
-
-def reminder_reply_keyboard(item: DueReminder) -> ReplyKeyboardMarkup | None:
-    """Client bottom menu on session reminders when enrollment message may have failed."""
-    if item.kind == "session_start" and item.person_role == "client":
-        return reply_markup_for_role("client")
-    return None
 
 
 async def send_due_reminder(bot: Bot, item: DueReminder) -> None:
