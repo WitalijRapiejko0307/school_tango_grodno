@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from zoneinfo import ZoneInfo
@@ -480,41 +482,449 @@ def _attendance_pick_rows(
     return rows
 
 
-_LIST_PICK_INDEX_PURPOSES = frozenset(
-    {
-        "grp",
-        "prd",
-        "today",
-        "sess",
-        "slot_week",
-        "slot_once",
-        "grp_slot",
-        "grp_roster",
-        "grp_stream",
-        "grp_assign",
-        "ppl_add",
-        "sub_partner",
+def _pick_ids_from_data(data: dict[str, object]) -> list[str]:
+    return list(data.get("pick_ids") or [])  # type: ignore[arg-type]
+
+
+@dataclass(frozen=True)
+class PickSpec:
+    is_index_pick: bool
+    build_rows: Callable[[AsyncSession, dict[str, object]], Awaitable[list[PickRow]]]
+    on_index_pick: (
+        Callable[[Message, FSMContext, list[PickRow]], Awaitable[None]] | None
+    ) = None
+    on_many_pick: (
+        Callable[[Message, FSMContext, list[PickRow], Person], Awaitable[None]] | None
+    ) = None
+    notice_recipient: (
+        Callable[[AsyncSession, PickRow], Awaitable[Person | None]] | None
+    ) = None
+    is_notice_multi: bool = False
+    more_callback: str | None = None
+
+
+async def _build_rows_grp(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    rows: list[PickRow] = []
+    for group_id in _pick_ids_from_data(data):
+        group = await session.get(Group, group_id)
+        if group is not None and group.archived_at is None:
+            rows.append(PickRow(id=group.id, full_name=group.name))
+    return rows
+
+
+async def _build_rows_active_groups(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    rows: list[PickRow] = []
+    for group_id in _pick_ids_from_data(data):
+        group = await session.get(Group, group_id)
+        if group is not None and group.archived_at is None:
+            rows.append(PickRow(id=group.id, full_name=group.name))
+    return rows
+
+
+async def _build_rows_school_sessions(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    rows: list[PickRow] = []
+    for school_session_id in _pick_ids_from_data(data):
+        school_session = await session.get(SchoolSession, school_session_id)
+        if school_session is None:
+            continue
+        gname = await _session_group_name(session, school_session.group_id)
+        detail = (
+            f"{format_school_datetime(school_session.starts_at)}, "
+            f"{school_session.place}"
+        )
+        rows.append(PickRow(id=school_session.id, full_name=gname, detail=detail))
+    return rows
+
+
+async def _build_rows_weekly_slots(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    rows: list[PickRow] = []
+    for slot_id in _pick_ids_from_data(data):
+        slot = await session.get(WeeklySlot, slot_id)
+        if slot is None or not slot.active:
+            continue
+        group = await session.get(Group, slot.group_id)
+        if group is None or group.archived_at is not None:
+            continue
+        detail = (
+            f"{WEEKDAY_LABELS[slot.weekday]} "
+            f"{slot.start_time.strftime('%H:%M')}, {slot.place}"
+        )
+        if slot.notes:
+            detail = f"{detail} ({slot.notes})"
+        rows.append(PickRow(id=slot.id, full_name=group.name, detail=detail))
+    return rows
+
+
+async def _build_rows_att(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    purpose = str(data.get("pick_purpose") or "")
+    school_session_id = purpose.split(":", 1)[1]
+    sess = await session.get(SchoolSession, school_session_id)
+    if sess is None:
+        return []
+    members = await _members_with_attendance(session, sess.group_id, school_session_id)
+    return _attendance_pick_rows(members)
+
+
+async def _build_rows_msg(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    return await _pick_rows_for_ids(
+        session, _pick_ids_from_data(data), with_group_detail=False
+    )
+
+
+async def _build_rows_guests(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    day_raw = data.get("pick_day")
+    if not day_raw:
+        return []
+    day = date.fromisoformat(str(day_raw))
+    guest_rows = await guest_day_summary(session, day)
+    by_rsvp = {
+        rsvp.id: (rsvp, guest, school_session)
+        for rsvp, guest, school_session in guest_rows
     }
+    rows: list[PickRow] = []
+    for rsvp_id in _pick_ids_from_data(data):
+        entry = by_rsvp.get(rsvp_id)
+        if entry is None:
+            continue
+        rsvp, guest, school_session = entry
+        phone = guest.phone or "—"
+        detail = (
+            f"{phone} — {format_school_datetime(school_session.starts_at)}, "
+            f"{school_session.place}"
+        )
+        rows.append(PickRow(id=rsvp.id, full_name=guest.full_name, detail=detail))
+    return rows
+
+
+async def _build_rows_reminders(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    day_raw = data.get("pick_day")
+    if not day_raw:
+        return []
+    day = date.fromisoformat(str(day_raw))
+    summary = await list_today_session_reminder_summary(session, day)
+    by_rem = {rem.id: (rem, person, detail) for rem, person, detail in summary}
+    rows: list[PickRow] = []
+    for rem_id in _pick_ids_from_data(data):
+        entry = by_rem.get(rem_id)
+        if entry is None:
+            continue
+        rem, person, detail = entry
+        rows.append(PickRow(id=rem.id, full_name=person.full_name, detail=detail))
+    return rows
+
+
+async def _build_rows_prd(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    return await _product_pick_rows(session, _pick_ids_from_data(data))
+
+
+async def _on_index_pick_grp(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _send_group_card(message, picked[0].id)
+
+
+async def _on_index_pick_prd(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _send_product_card(message, picked[0].id)
+
+
+async def _on_index_pick_today(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _start_admin_attendance_pick(message, state, picked[0].id)
+
+
+async def _on_index_pick_sess(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _send_notice_session_actions(message, picked[0].id)
+
+
+async def _on_index_pick_slot_week(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await state.update_data(mode="edit_all", slot_id=picked[0].id)
+    await message.answer(
+        "Новый день недели:",
+        reply_markup=_weekday_keyboard("wday"),
+    )
+
+
+async def _on_index_pick_slot_once(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await state.update_data(mode="edit_one", slot_id=picked[0].id)
+    await state.set_state(WeekFSM.once_date)
+    await message.answer("Дата занятия (ДД-ММ-ГГГГ):")
+
+
+async def _on_index_pick_grp_slot(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await state.update_data(mode="new", group_id=picked[0].id)
+    await message.answer(
+        "День недели:",
+        reply_markup=_weekday_keyboard("wday"),
+    )
+
+
+async def _on_index_pick_grp_roster(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _begin_roster_group(message, state, picked[0].id)
+
+
+async def _on_index_pick_grp_stream(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    group_id = picked[0].id
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None:
+            await message.answer("Не найдено")
+            return
+        kb = await _stream_pick_keyboard(
+            session, mode="edit_group", group_id=group_id
+        )
+    await state.update_data(edit_group_id=group_id)
+    await message.answer(f"Поток для группы «{group.name}»:", reply_markup=kb)
+
+
+async def _on_index_pick_grp_assign(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _apply_assign_group_choice(message, state, picked[0].id)
+
+
+async def _on_index_pick_ppl_add(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _apply_ppl_add_choice(message, state, picked[0].id)
+
+
+async def _on_index_pick_sub_partner(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _after_people_pick(message, state, picked[0].id, "sub_partner")
+
+
+async def _notice_recipient_msg(
+    session: AsyncSession, row: PickRow
+) -> Person | None:
+    return await session.get(Person, row.id)
+
+
+async def _notice_recipient_guests(
+    session: AsyncSession, row: PickRow
+) -> Person | None:
+    rsvp = await session.get(GuestRsvp, row.id)
+    if rsvp is None:
+        return None
+    return await session.get(Person, rsvp.person_id)
+
+
+async def _notice_recipient_reminders(
+    session: AsyncSession, row: PickRow
+) -> Person | None:
+    rem = await session.get(Reminder, row.id)
+    if rem is None:
+        return None
+    return await session.get(Person, rem.person_id)
+
+
+async def _on_many_pick_notice(
+    message: Message,
+    state: FSMContext,
+    picked: list[PickRow],
+    admin: Person,
+) -> None:
+    data = await state.get_data()
+    purpose = str(data.get("pick_purpose") or "")
+    await state.set_state(ListPickFSM.notice_text)
+    await state.update_data(
+        notice_purpose=purpose,
+        notice_pick_ids=[row.id for row in picked],
+    )
+    await message.answer("Текст сообщения:")
+
+
+async def _on_many_pick_att(
+    message: Message,
+    state: FSMContext,
+    picked: list[PickRow],
+    admin: Person,
+) -> None:
+    data = await state.get_data()
+    purpose = str(data.get("pick_purpose") or "")
+    school_session_id = purpose.split(":", 1)[1]
+    async with async_session_maker() as session:
+        rows = await _list_pick_rows_from_data(session, data)
+    number_by_id = {row.id: index + 1 for index, row in enumerate(rows)}
+    report_lines: list[tuple[int, str, str]] = []
+    async with async_session_maker() as session:
+        for row in picked:
+            number = number_by_id[row.id]
+            person = await session.get(Person, row.id)
+            if person is None:
+                continue
+            if person.telegram_user_id is None:
+                report_lines.append((number, row.full_name, "не в боте"))
+                continue
+            att_result = await session.execute(
+                select(Attendance).where(
+                    Attendance.person_id == person.id,
+                    Attendance.session_id == school_session_id,
+                )
+            )
+            existing = att_result.scalar_one_or_none()
+            if existing is not None:
+                await session.delete(existing)
+                outcome = "снят"
+            else:
+                await mark_attendance(
+                    session,
+                    person.id,
+                    school_session_id,
+                    "admin",
+                    marked_by_id=admin.id,
+                )
+                outcome = "отмечен"
+            report_lines.append((number, row.full_name, outcome))
+        await session.commit()
+    await message.answer(attendance_report(report_lines))
+
+
+REGISTRY: dict[str, PickSpec] = {
+    "grp": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_grp,
+        on_index_pick=_on_index_pick_grp,
+    ),
+    "prd": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_prd,
+        on_index_pick=_on_index_pick_prd,
+    ),
+    "today": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_school_sessions,
+        on_index_pick=_on_index_pick_today,
+    ),
+    "sess": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_school_sessions,
+        on_index_pick=_on_index_pick_sess,
+    ),
+    "slot_week": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_weekly_slots,
+        on_index_pick=_on_index_pick_slot_week,
+    ),
+    "slot_once": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_weekly_slots,
+        on_index_pick=_on_index_pick_slot_once,
+    ),
+    "grp_slot": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_active_groups,
+        on_index_pick=_on_index_pick_grp_slot,
+    ),
+    "grp_roster": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_active_groups,
+        on_index_pick=_on_index_pick_grp_roster,
+    ),
+    "grp_stream": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_active_groups,
+        on_index_pick=_on_index_pick_grp_stream,
+    ),
+    "grp_assign": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_active_groups,
+        on_index_pick=_on_index_pick_grp_assign,
+    ),
+    "ppl_add": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_active_groups,
+        on_index_pick=_on_index_pick_ppl_add,
+    ),
+    "sub_partner": PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_msg,
+        on_index_pick=_on_index_pick_sub_partner,
+    ),
+    "msg": PickSpec(
+        is_index_pick=False,
+        build_rows=_build_rows_msg,
+        is_notice_multi=True,
+        notice_recipient=_notice_recipient_msg,
+        on_many_pick=_on_many_pick_notice,
+    ),
+    "guests": PickSpec(
+        is_index_pick=False,
+        build_rows=_build_rows_guests,
+        is_notice_multi=True,
+        notice_recipient=_notice_recipient_guests,
+        on_many_pick=_on_many_pick_notice,
+    ),
+    "reminders": PickSpec(
+        is_index_pick=False,
+        build_rows=_build_rows_reminders,
+        is_notice_multi=True,
+        notice_recipient=_notice_recipient_reminders,
+        on_many_pick=_on_many_pick_notice,
+    ),
+}
+
+_ATT_PICK_SPEC = PickSpec(
+    is_index_pick=False,
+    more_callback="att_more",
+    build_rows=_build_rows_att,
+    on_many_pick=_on_many_pick_att,
 )
 
 
-def _list_pick_more_callback(purpose: str) -> str:
+def _get_pick_spec(purpose: str) -> PickSpec | None:
     if purpose.startswith("att:"):
-        return "att_more"
-    if purpose == "grp":
-        return "grp_more"
-    if purpose == "prd":
-        return "prd_more"
-    if purpose == "today":
-        return "today_more"
-    if purpose in _LIST_PICK_INDEX_PURPOSES:
-        return f"{purpose}_more"
+        return _ATT_PICK_SPEC
+    return REGISTRY.get(purpose)
+
+
+def _list_pick_more_callback(purpose: str) -> str:
+    spec = _get_pick_spec(purpose)
+    if spec is not None:
+        if spec.more_callback is not None:
+            return spec.more_callback
+        if spec.is_index_pick:
+            return f"{purpose}_more"
     return "msg_more"
 
 
 def _list_pick_hint(purpose: str) -> str:
-    if purpose in _LIST_PICK_INDEX_PURPOSES:
-        return HINT_INDEX
+    spec = _get_pick_spec(purpose)
+    if spec is not None:
+        return HINT_INDEX if spec.is_index_pick else HINT_MANY
     return HINT_MANY
 
 
@@ -573,121 +983,22 @@ async def _list_pick_rows_from_data(
     session: AsyncSession, data: dict[str, object]
 ) -> list[PickRow]:
     purpose = str(data.get("pick_purpose") or "")
-    pick_ids: list[str] = list(data.get("pick_ids") or [])  # type: ignore[arg-type]
-    if purpose.startswith("att:"):
-        school_session_id = purpose.split(":", 1)[1]
-        sess = await session.get(SchoolSession, school_session_id)
-        if sess is None:
-            return []
-        members = await _members_with_attendance(
-            session, sess.group_id, school_session_id
-        )
-        return _attendance_pick_rows(members)
-    if purpose == "msg":
-        return await _pick_rows_for_ids(session, pick_ids, with_group_detail=False)
-    if purpose == "guests":
-        day_raw = data.get("pick_day")
-        if not day_raw:
-            return []
-        day = date.fromisoformat(str(day_raw))
-        guest_rows = await guest_day_summary(session, day)
-        by_rsvp = {rsvp.id: (rsvp, guest, school_session) for rsvp, guest, school_session in guest_rows}
-        rows: list[PickRow] = []
-        for rsvp_id in pick_ids:
-            entry = by_rsvp.get(rsvp_id)
-            if entry is None:
-                continue
-            rsvp, guest, school_session = entry
-            phone = guest.phone or "—"
-            detail = (
-                f"{phone} — {format_school_datetime(school_session.starts_at)}, "
-                f"{school_session.place}"
-            )
-            rows.append(PickRow(id=rsvp.id, full_name=guest.full_name, detail=detail))
-        return rows
-    if purpose == "reminders":
-        day_raw = data.get("pick_day")
-        if not day_raw:
-            return []
-        day = date.fromisoformat(str(day_raw))
-        summary = await list_today_session_reminder_summary(session, day)
-        by_rem = {rem.id: (rem, person, detail) for rem, person, detail in summary}
-        rows = []
-        for rem_id in pick_ids:
-            entry = by_rem.get(rem_id)
-            if entry is None:
-                continue
-            _rem, person, detail = entry
-            rows.append(PickRow(id=_rem.id, full_name=person.full_name, detail=detail))
-        return rows
-    if purpose == "grp":
-        rows = []
-        for group_id in pick_ids:
-            group = await session.get(Group, group_id)
-            if group is not None and group.archived_at is None:
-                rows.append(PickRow(id=group.id, full_name=group.name))
-        return rows
-    if purpose == "prd":
-        return await _product_pick_rows(session, pick_ids)
-    if purpose in ("today", "sess"):
-        rows = []
-        for school_session_id in pick_ids:
-            school_session = await session.get(SchoolSession, school_session_id)
-            if school_session is None:
-                continue
-            gname = await _session_group_name(session, school_session.group_id)
-            detail = (
-                f"{format_school_datetime(school_session.starts_at)}, "
-                f"{school_session.place}"
-            )
-            rows.append(PickRow(id=school_session.id, full_name=gname, detail=detail))
-        return rows
-    if purpose in ("slot_week", "slot_once"):
-        rows = []
-        for slot_id in pick_ids:
-            slot = await session.get(WeeklySlot, slot_id)
-            if slot is None or not slot.active:
-                continue
-            group = await session.get(Group, slot.group_id)
-            if group is None or group.archived_at is not None:
-                continue
-            detail = (
-                f"{WEEKDAY_LABELS[slot.weekday]} "
-                f"{slot.start_time.strftime('%H:%M')}, {slot.place}"
-            )
-            if slot.notes:
-                detail = f"{detail} ({slot.notes})"
-            rows.append(PickRow(id=slot.id, full_name=group.name, detail=detail))
-        return rows
-    if purpose in ("grp_slot", "grp_roster", "grp_stream", "grp_assign", "ppl_add"):
-        rows = []
-        for group_id in pick_ids:
-            group = await session.get(Group, group_id)
-            if group is not None and group.archived_at is None:
-                rows.append(PickRow(id=group.id, full_name=group.name))
-        return rows
-    if purpose == "sub_partner":
-        return await _pick_rows_for_ids(session, pick_ids, with_group_detail=False)
-    return []
+    spec = _get_pick_spec(purpose)
+    if spec is None:
+        return []
+    return await spec.build_rows(session, data)
 
 
 async def _persons_for_notice_pick(
     session: AsyncSession, purpose: str, picked: list[PickRow]
 ) -> list[Person]:
+    spec = _get_pick_spec(purpose)
+    if spec is None or spec.notice_recipient is None:
+        return []
     seen: set[str] = set()
     people: list[Person] = []
     for row in picked:
-        person: Person | None = None
-        if purpose == "msg":
-            person = await session.get(Person, row.id)
-        elif purpose == "guests":
-            rsvp = await session.get(GuestRsvp, row.id)
-            if rsvp is not None:
-                person = await session.get(Person, rsvp.person_id)
-        elif purpose == "reminders":
-            rem = await session.get(Reminder, row.id)
-            if rem is not None:
-                person = await session.get(Person, rem.person_id)
+        person = await spec.notice_recipient(session, row)
         if person is not None and person.id not in seen:
             seen.add(person.id)
             people.append(person)
@@ -4825,7 +5136,8 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         await message.answer("Список устарел.")
         return
 
-    if purpose in _LIST_PICK_INDEX_PURPOSES:
+    spec = _get_pick_spec(purpose)
+    if spec is not None and spec.is_index_pick:
         if purpose == "ppl_add" and not message.text.strip().isdigit():
             await message.answer(HINT_INDEX)
             return
@@ -4849,64 +5161,8 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         except PickError as exc:
             await message.answer(exc.message)
             return
-        if purpose == "grp":
-            await _send_group_card(message, picked[0].id)
-            return
-        if purpose == "prd":
-            await _send_product_card(message, picked[0].id)
-            return
-        if purpose == "today":
-            await _start_admin_attendance_pick(message, state, picked[0].id)
-            return
-        if purpose == "sess":
-            await _send_notice_session_actions(message, picked[0].id)
-            return
-        if purpose == "slot_week":
-            await state.update_data(mode="edit_all", slot_id=picked[0].id)
-            await message.answer(
-                "Новый день недели:",
-                reply_markup=_weekday_keyboard("wday"),
-            )
-            return
-        if purpose == "slot_once":
-            await state.update_data(mode="edit_one", slot_id=picked[0].id)
-            await state.set_state(WeekFSM.once_date)
-            await message.answer("Дата занятия (ДД-ММ-ГГГГ):")
-            return
-        if purpose == "grp_slot":
-            await state.update_data(mode="new", group_id=picked[0].id)
-            await message.answer(
-                "День недели:",
-                reply_markup=_weekday_keyboard("wday"),
-            )
-            return
-        if purpose == "grp_roster":
-            await _begin_roster_group(message, state, picked[0].id)
-            return
-        if purpose == "grp_stream":
-            group_id = picked[0].id
-            async with async_session_maker() as session:
-                group = await session.get(Group, group_id)
-                if group is None:
-                    await message.answer("Не найдено")
-                    return
-                kb = await _stream_pick_keyboard(
-                    session, mode="edit_group", group_id=group_id
-                )
-            await state.update_data(edit_group_id=group_id)
-            await message.answer(
-                f"Поток для группы «{group.name}»:", reply_markup=kb
-            )
-            return
-        if purpose == "grp_assign":
-            await _apply_assign_group_choice(message, state, picked[0].id)
-            return
-        if purpose == "ppl_add":
-            await _apply_ppl_add_choice(message, state, picked[0].id)
-            return
-        if purpose == "sub_partner":
-            await _after_people_pick(message, state, picked[0].id, "sub_partner")
-            return
+        if spec.on_index_pick is not None:
+            await spec.on_index_pick(message, state, picked)
         return
 
     try:
@@ -4915,51 +5171,8 @@ async def fsm_list_pick_waiting(message: Message, state: FSMContext) -> None:
         await message.answer(exc.message)
         return
 
-    if purpose.startswith("att:"):
-        school_session_id = purpose.split(":", 1)[1]
-        number_by_id = {row.id: index + 1 for index, row in enumerate(rows)}
-        report_lines: list[tuple[int, str, str]] = []
-        async with async_session_maker() as session:
-            for row in picked:
-                number = number_by_id[row.id]
-                person = await session.get(Person, row.id)
-                if person is None:
-                    continue
-                if person.telegram_user_id is None:
-                    report_lines.append((number, row.full_name, "не в боте"))
-                    continue
-                att_result = await session.execute(
-                    select(Attendance).where(
-                        Attendance.person_id == person.id,
-                        Attendance.session_id == school_session_id,
-                    )
-                )
-                existing = att_result.scalar_one_or_none()
-                if existing is not None:
-                    await session.delete(existing)
-                    outcome = "снят"
-                else:
-                    await mark_attendance(
-                        session,
-                        person.id,
-                        school_session_id,
-                        "admin",
-                        marked_by_id=admin.id,
-                    )
-                    outcome = "отмечен"
-                report_lines.append((number, row.full_name, outcome))
-            await session.commit()
-        await message.answer(attendance_report(report_lines))
-        return
-
-    if purpose in ("msg", "guests", "reminders"):
-        await state.set_state(ListPickFSM.notice_text)
-        await state.update_data(
-            notice_purpose=purpose,
-            notice_pick_ids=[row.id for row in picked],
-        )
-        await message.answer("Текст сообщения:")
-        return
+    if spec is not None and spec.on_many_pick is not None:
+        await spec.on_many_pick(message, state, picked, admin)
 
 
 @router.message(ListPickFSM.notice_text, F.text)
