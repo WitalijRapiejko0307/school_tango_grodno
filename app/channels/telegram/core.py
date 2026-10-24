@@ -3,8 +3,8 @@
 from __future__ import annotations
 
 import logging
-import re
-from datetime import UTC, date, datetime, timedelta
+from datetime import UTC, datetime, timedelta
+
 from aiogram import Bot, F, Router
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
@@ -14,38 +14,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from sqlalchemy import and_, select
+from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from .states import (
-    AdminMenuFSM,
-    AssignGroupFSM,
-    EnrollFSM,
-    GroupRenameFSM,
-    GroupStreamFSM,
-    GuestPickFSM,
-    ListPickFSM,
-    NewGroupFSM,
-    PeoplePickFSM,
-    RosterFSM,
-    SlotFSM,
-    WeekFSM,
-)
-
-# Referenced only for `from .legacy import *` (no handlers in this module yet).
-_REEXPORT_ONLY_FSM = (AdminMenuFSM, AssignGroupFSM, SlotFSM)
+from .states import EnrollFSM, ListPickFSM
 from app.db import async_session_maker
-from app.models import (
-    Attendance,
-    WeeklySlot,
-    Group,
-    GroupMembership,
-    Person,
-    Reminder,
-    SchoolSession,
-    Stream,
-)
-from app.services.attendance import mark_attendance
+from app.models import Person, SchoolSession
 from app.services.billing import active_subscription
 from app.services.identity import (
     has_pending_phone_invite,
@@ -54,13 +28,6 @@ from app.services.identity import (
 from app.services.bot_messages import (
     bind_outbound_school_session_id,
     reset_outbound_context,
-)
-from app.services.notices import (
-    cancel_notice_text,
-    group_audience,
-    notice_audience,
-    reschedule_notice_text,
-    upcoming_sessions,
 )
 from app.services.notifications import (
     DueReminder,
@@ -72,71 +39,32 @@ from app.services.notifications import (
     second_booking_prompt_text,
 )
 from app.services.school_time import format_school_date, format_school_datetime
-from app.services.ocr import extract_roster_lines
 from app.services.roster import (
-    RosterDraftItem,
     admin_contacts,
     claim_person,
-    confirm_roster,
     find_unclaimed_by_query,
-    parse_roster_line,
 )
 from app.services.pick_list import (
     HINT_INDEX,
     PickError,
     PickRow,
-    attendance_report,
     page_text,
     resolve_picks,
-    short_report,
 )
-from app.services.schedule import (
-    WEEKDAY_LABELS,
-    archive_group,
-    assign_group,
-    cancel_occurrence,
-    count_archive_impact,
-    count_slot_deactivate_impact,
-    create_group,
-    create_stream,
-    create_weekly_slot,
-    deactivate_weekly_slot,
-    ensure_occurrence,
-    group_transfer_confirmation_text,
-    materialize_range,
-    override_occurrence,
-    parse_dmy,
-    rename_group,
-    restore_group,
-    restore_weekly_slot,
-    set_group_stream,
-    update_weekly_slot,
-)
+from app.services.schedule import materialize_range
 
 logger = logging.getLogger(__name__)
 
-router = Router(name="telegram")
+router = Router(name="telegram.core")
 
-from .billing import (  # noqa: E402
-    _prompt_open_sub_products,
-    _report_open_subscription,
-)
 from .people import (  # noqa: E402
     _active_membership,
     _format_admin_contacts_list,
-    _format_contacts,
-    _list_non_admin_pick_rows,
-    _prompt_leave_person,
-    _send_person_card,
-    _start_people_pick,
 )
 from .common import (  # noqa: E402
     ARCHIVED_ACCESS_CLOSED,
     BTN_BALANCE,
-    BTN_GROUPS,
-    BTN_MY_GROUP,
     BTN_OTHER_GROUP,
-    BTN_SCHEDULE,
     BTN_TODAY,
     REFUSAL,
     _BlockArchivedMiddleware,
@@ -144,25 +72,16 @@ from .common import (  # noqa: E402
     _ensure_person,
     _guest_keyboard_with_phone,
     _is_admin,
-    _parse_hhmm,
     _person_by_telegram,
     _require_admin_callback,
-    _require_admin_message,
     _require_admin_message_strict,
-    _school_tz,
     _get_pick_spec,
     _list_pick_hint,
     _list_pick_keyboard,
     _list_pick_more_callback,
     _list_pick_rows_from_data,
-    _pick_ids_from_data,
-    _send_notice,
     _start_list_pick,
     _today_local,
-    _weekday_keyboard,
-    PickSpec,
-    register_att_pick_spec,
-    register_pick_spec,
     reminder_inline_markup,
     reminder_reply_keyboard,
     reply_markup_for_role,

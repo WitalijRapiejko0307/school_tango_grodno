@@ -42,7 +42,6 @@ from app.services.pick_list import (
     HINT_INDEX,
     PickRow,
     attendance_report,
-    page_text,
     short_report,
 )
 from app.services.roster import (
@@ -82,7 +81,6 @@ from .common import (
     PickSpec,
     _BlockArchivedMiddleware,
     _TrackUserMessageMiddleware,
-    _is_admin,
     _list_pick_rows_from_data,
     _parse_hhmm,
     _person_by_telegram,
@@ -315,7 +313,7 @@ async def _on_index_pick_grp(
 async def _on_index_pick_today(
     message: Message, state: FSMContext, picked: list[PickRow]
 ) -> None:
-    from .legacy import _start_admin_attendance_pick
+    from .core import _start_admin_attendance_pick
 
     await _start_admin_attendance_pick(message, state, picked[0].id)
 
