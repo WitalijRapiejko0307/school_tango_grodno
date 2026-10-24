@@ -62,7 +62,7 @@ router.callback_query.middleware(_BlockArchivedMiddleware())
 async def _build_rows_msg(
     session: AsyncSession, data: dict[str, object]
 ) -> list[PickRow]:
-    from .legacy import _pick_rows_for_ids
+    from .people import _pick_rows_for_ids
 
     return await _pick_rows_for_ids(
         session, _pick_ids_from_data(data), with_group_detail=False

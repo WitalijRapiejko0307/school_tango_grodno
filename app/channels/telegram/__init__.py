@@ -2,6 +2,7 @@ from aiogram import Router
 
 from .billing import router as _billing_router
 from .notices import router as _notices_router
+from .people import router as _people_router
 from .legacy import (  # noqa: F401
     send_due_reminder,
     async_session_maker,
@@ -21,4 +22,5 @@ from .legacy import *  # noqa: F401,F403
 router = Router(name="telegram")
 router.include_router(_billing_router)
 router.include_router(_notices_router)
+router.include_router(_people_router)
 router.include_router(_legacy_router)

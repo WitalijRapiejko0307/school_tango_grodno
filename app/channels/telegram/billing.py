@@ -155,7 +155,7 @@ async def cb_open_sub_person(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data.startswith("open_sub_prod:"))
 async def cb_open_sub_product(query: CallbackQuery, state: FSMContext) -> None:
-    from .legacy import _list_client_pick_rows
+    from .people import _list_client_pick_rows
 
     if query.data is None:
         return
@@ -236,7 +236,7 @@ async def cb_price_dropin(query: CallbackQuery, state: FSMContext) -> None:
 
 @router.callback_query(F.data == "price_open_sub")
 async def cb_price_open_sub(query: CallbackQuery, state: FSMContext) -> None:
-    from .legacy import _list_client_pick_rows, _start_people_pick
+    from .people import _list_client_pick_rows, _start_people_pick
 
     if await _require_admin_callback(query) is None:
         return
