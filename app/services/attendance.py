@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.config import get_settings
-from app.models import Attendance, DropInCharge, Person, Product, SchoolSession
+from app.models import Attendance, DropInCharge, Group, Person, Product, SchoolSession
 from app.services.billing import (
     active_subscription,
     covering_subscription_for_refund,
@@ -26,6 +26,14 @@ def _as_aware(dt: datetime) -> datetime:
     if dt.tzinfo is None:
         return dt.replace(tzinfo=timezone.utc)
     return dt
+
+
+def _group_active_on(group: Group, on_date: date, tz: ZoneInfo) -> bool:
+    """True if the group was still active on calendar day on_date (school TZ)."""
+    if group.archived_at is None:
+        return True
+    archived_day = _as_aware(group.archived_at).astimezone(tz).date()
+    return archived_day > on_date
 
 
 async def _active_drop_in_product(session: AsyncSession):
@@ -48,7 +56,11 @@ async def find_sessions_at(
     on_date: date,
     at_time: time,
 ) -> list[SchoolSession]:
-    """Materialize the day and return scheduled sessions starting at at_time (school TZ)."""
+    """Materialize the day and return scheduled sessions starting at at_time (school TZ).
+
+    Groups archived on or before on_date are excluded. Groups archived later still
+    match (caller may label them as archived in UI).
+    """
     await materialize_range(session, on_date, on_date + timedelta(days=1))
     tz = ZoneInfo(get_settings().SCHOOL_TZ)
     day_start = datetime(
@@ -56,7 +68,8 @@ async def find_sessions_at(
     ).astimezone(timezone.utc)
     day_end = day_start + timedelta(days=1)
     result = await session.execute(
-        select(SchoolSession)
+        select(SchoolSession, Group)
+        .join(Group, SchoolSession.group_id == Group.id)
         .where(
             SchoolSession.status == "scheduled",
             SchoolSession.starts_at >= day_start,
@@ -65,7 +78,9 @@ async def find_sessions_at(
         .order_by(SchoolSession.starts_at)
     )
     matches: list[SchoolSession] = []
-    for school_session in result.scalars().all():
+    for school_session, group in result.all():
+        if not _group_active_on(group, on_date, tz):
+            continue
         local = _as_aware(school_session.starts_at).astimezone(tz)
         if local.hour == at_time.hour and local.minute == at_time.minute:
             matches.append(school_session)

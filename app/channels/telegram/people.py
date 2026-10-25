@@ -141,6 +141,14 @@ def _pair_error_message(exc: ValueError) -> str:
     return _PAIR_ERROR_RU.get(str(exc), "Не удалось изменить пару.")
 
 
+def _group_visit_name(group: Group | None) -> str:
+    if group is None:
+        return "?"
+    if group.archived_at is not None:
+        return f"{group.name} (архив)"
+    return group.name
+
+
 def _session_visit_line(
     session: SchoolSession, group_name: str | None = None
 ) -> str:
@@ -1075,8 +1083,7 @@ async def _session_label(session: AsyncSession, school_session_id: str) -> str:
     if school_session is None:
         return "занятие"
     group = await session.get(Group, school_session.group_id)
-    name = group.name if group is not None else "?"
-    return _session_visit_line(school_session, name)
+    return _session_visit_line(school_session, _group_visit_name(group))
 
 
 async def _clear_visit_cancel(message: Message, state: FSMContext) -> bool:
@@ -1122,8 +1129,9 @@ async def _resolve_visit_sessions(
         ids: list[str] = []
         for index, school_session in enumerate(matches, start=1):
             group = await session.get(Group, school_session.group_id)
-            name = group.name if group is not None else "?"
-            lines.append(f"{index}. {_session_visit_line(school_session, name)}")
+            lines.append(
+                f"{index}. {_session_visit_line(school_session, _group_visit_name(group))}"
+            )
             ids.append(school_session.id)
         await state.update_data(visit_pick_ids=ids)
         await state.set_state(PersonVisitFSM.pick)

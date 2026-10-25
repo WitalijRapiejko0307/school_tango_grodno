@@ -453,3 +453,69 @@ async def test_find_sessions_at_matches_local_start(
     assert matches[0].place == "Hall"
     empty = await find_sessions_at(db_session, date(2026, 10, 6), time(18, 0))
     assert empty == []
+
+
+async def _session_on_day(
+    db_session: AsyncSession,
+    group_id: str,
+    on_date: date,
+    at_time: time = time(19, 0),
+    place: str = "Hall",
+) -> SchoolSession:
+    # Store UTC so SQLite round-trip matches find_sessions_at (_as_aware assumes UTC).
+    tz = ZoneInfo("Europe/Minsk")
+    starts = datetime(
+        on_date.year, on_date.month, on_date.day, at_time.hour, at_time.minute, tzinfo=tz
+    ).astimezone(timezone.utc)
+    ends = datetime(
+        on_date.year, on_date.month, on_date.day, 20, 30, tzinfo=tz
+    ).astimezone(timezone.utc)
+    return await create_session(db_session, group_id, starts, ends, place, None)
+
+
+async def test_find_sessions_at_includes_group_archived_after_date(
+    db_session: AsyncSession,
+) -> None:
+    on_date = date(2026, 10, 6)
+    group = await create_group(db_session, "Later archived")
+    await _session_on_day(db_session, group.id, on_date)
+    group.archived_at = datetime(2026, 10, 10, 12, 0, tzinfo=timezone.utc)
+    await db_session.flush()
+
+    matches = await find_sessions_at(db_session, on_date, time(19, 0))
+    assert len(matches) == 1
+    assert matches[0].group_id == group.id
+
+
+async def test_find_sessions_at_excludes_group_archived_on_or_before_date(
+    db_session: AsyncSession,
+) -> None:
+    on_date = date(2026, 10, 6)
+    same_day = await create_group(db_session, "Archived same day")
+    await _session_on_day(db_session, same_day.id, on_date, place="A")
+    same_day.archived_at = datetime(2026, 10, 6, 15, 0, tzinfo=timezone.utc)
+
+    before = await create_group(db_session, "Archived before")
+    await _session_on_day(db_session, before.id, on_date, place="B")
+    before.archived_at = datetime(2026, 10, 1, 12, 0, tzinfo=timezone.utc)
+    await db_session.flush()
+
+    matches = await find_sessions_at(db_session, on_date, time(19, 0))
+    assert matches == []
+
+
+async def test_find_sessions_at_mixed_active_and_archived_after_date(
+    db_session: AsyncSession,
+) -> None:
+    on_date = date(2026, 10, 6)
+    active = await create_group(db_session, "Active")
+    await _session_on_day(db_session, active.id, on_date, place="Active hall")
+
+    archived = await create_group(db_session, "Was active")
+    await _session_on_day(db_session, archived.id, on_date, place="Old hall")
+    archived.archived_at = datetime(2026, 10, 20, 12, 0, tzinfo=timezone.utc)
+    await db_session.flush()
+
+    matches = await find_sessions_at(db_session, on_date, time(19, 0))
+    places = {m.place for m in matches}
+    assert places == {"Active hall", "Old hall"}
