@@ -19,7 +19,6 @@ from app.models import (
     GroupMembership,
     Person,
     SchoolSession,
-    Stream,
 )
 from app.services.notifications import record_coming
 from app.services.schedule import materialize_range
@@ -184,7 +183,6 @@ async def _sessions_on_date(
             SchoolSession.starts_at >= start_utc,
             SchoolSession.starts_at < end_utc,
             SchoolSession.status == "scheduled",
-            Group.stream_id.isnot(None),
             Group.archived_at.is_(None),
         )
         .order_by(SchoolSession.starts_at)
@@ -192,40 +190,37 @@ async def _sessions_on_date(
     return list(result.all())
 
 
-async def sessions_for_stream_on_date(
-    session: AsyncSession, stream_id: str, gather_date: date
+async def sessions_for_person_on_date(
+    session: AsyncSession, person_id: str, gather_date: date
 ) -> list[GatherSessionRow]:
+    memberships = await session.execute(
+        select(GroupMembership.group_id).where(
+            GroupMembership.person_id == person_id,
+            GroupMembership.ended_on.is_(None),
+        )
+    )
+    group_ids = set(memberships.scalars().all())
     rows: list[GatherSessionRow] = []
     for school_session, group in await _sessions_on_date(session, gather_date):
-        if group.stream_id != stream_id:
+        if group.id not in group_ids:
             continue
-        rows.append(GatherSessionRow(school_session=school_session, group_name=group.name))
+        rows.append(
+            GatherSessionRow(school_session=school_session, group_name=group.name)
+        )
     return rows
 
 
-async def _stream_ids_with_sessions_today(
+async def _eligible_persons_today(
     session: AsyncSession, gather_date: date
-) -> list[str]:
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for _, group in await _sessions_on_date(session, gather_date):
-        if group.stream_id is None or group.stream_id in seen:
-            continue
-        seen.add(group.stream_id)
-        ordered.append(group.stream_id)
-    return ordered
-
-
-async def _eligible_persons_for_stream(
-    session: AsyncSession, stream_id: str
 ) -> list[Person]:
+    group_ids = [group.id for _, group in await _sessions_on_date(session, gather_date)]
+    if not group_ids:
+        return []
     result = await session.execute(
         select(Person)
         .join(GroupMembership, GroupMembership.person_id == Person.id)
-        .join(Group, Group.id == GroupMembership.group_id)
         .where(
-            Group.stream_id == stream_id,
-            Group.archived_at.is_(None),
+            GroupMembership.group_id.in_(group_ids),
             GroupMembership.ended_on.is_(None),
             Person.telegram_user_id.isnot(None),
             Person.archived_at.is_(None),
@@ -238,13 +233,11 @@ async def _eligible_persons_for_stream(
 async def _existing_day_gather(
     session: AsyncSession,
     person_id: str,
-    stream_id: str,
     gather_date: date,
 ) -> DayGather | None:
     result = await session.execute(
         select(DayGather).where(
             DayGather.person_id == person_id,
-            DayGather.stream_id == stream_id,
             DayGather.gather_date == gather_date,
         )
     )
@@ -255,7 +248,6 @@ async def _send_gather_message(
     session: AsyncSession,
     bot: Bot,
     person: Person,
-    stream_id: str,
     gather_date: date,
     session_rows: list[GatherSessionRow],
     *,
@@ -272,7 +264,6 @@ async def _send_gather_message(
     if day_gather is None:
         day_gather = DayGather(
             person_id=person.id,
-            stream_id=stream_id,
             gather_date=gather_date,
             response=DayGatherResponse.NONE,
         )
@@ -286,7 +277,7 @@ async def _send_gather_message(
         )
     except Exception:
         logger.exception(
-            "Failed to send gather to person %s stream %s", person.id, stream_id
+            "Failed to send gather to person %s", person.id
         )
         if day_gather.sent_at is None:
             await session.delete(day_gather)
@@ -305,8 +296,8 @@ async def apply_gather_selection(
     now: datetime,
 ) -> tuple[bool, str]:
     """Apply numeric reply. Returns (ok, user_message)."""
-    rows = await sessions_for_stream_on_date(
-        session, day_gather.stream_id, day_gather.gather_date
+    rows = await sessions_for_person_on_date(
+        session, day_gather.person_id, day_gather.gather_date
     )
     validated = validate_gather_indexes(indexes, len(rows))
     if validated is None:
@@ -362,14 +353,13 @@ async def list_today_gather_summary(
 ) -> list[tuple[DayGather, Person, str]]:
     """Morning gather rows for the admin reminders screen on ``day``."""
     result = await session.execute(
-        select(DayGather, Person, Stream)
+        select(DayGather, Person)
         .join(Person, DayGather.person_id == Person.id)
-        .join(Stream, DayGather.stream_id == Stream.id)
         .where(DayGather.gather_date == day)
-        .order_by(Person.full_name, Stream.name)
+        .order_by(Person.full_name)
     )
     rows: list[tuple[DayGather, Person, str]] = []
-    for day_gather, person, stream in result.all():
+    for day_gather, person in result.all():
         chosen = ""
         if day_gather.selected_session_ids:
             ids = [
@@ -388,7 +378,7 @@ async def list_today_gather_summary(
                     for school_session, group in sessions.all()
                 ]
                 chosen = ", ".join(parts)
-        detail = f"поток «{stream.name}», {_gather_status_ru(day_gather, chosen)}"
+        detail = _gather_status_ru(day_gather, chosen)
         rows.append((day_gather, person, detail))
     return rows
 
@@ -399,9 +389,11 @@ async def process_due_gathers(
     gather_date = local_school_date(now)
 
     if morning_gather_due(now):
-        for stream_id in await _stream_ids_with_sessions_today(session, gather_date):
-            session_rows = await sessions_for_stream_on_date(
-                session, stream_id, gather_date
+        for person in await _eligible_persons_today(session, gather_date):
+            if await _existing_day_gather(session, person.id, gather_date) is not None:
+                continue
+            session_rows = await sessions_for_person_on_date(
+                session, person.id, gather_date
             )
             if not session_rows:
                 continue
@@ -410,20 +402,14 @@ async def process_due_gathers(
                 for row in session_rows
             ):
                 continue
-            for person in await _eligible_persons_for_stream(session, stream_id):
-                if await _existing_day_gather(
-                    session, person.id, stream_id, gather_date
-                ) is not None:
-                    continue
-                await _send_gather_message(
-                    session,
-                    bot,
-                    person,
-                    stream_id,
-                    gather_date,
-                    session_rows,
-                    nudge=False,
-                )
+            await _send_gather_message(
+                session,
+                bot,
+                person,
+                gather_date,
+                session_rows,
+                nudge=False,
+            )
 
     nudge_result = await session.execute(
         select(DayGather).where(
@@ -434,8 +420,8 @@ async def process_due_gathers(
         )
     )
     for day_gather in nudge_result.scalars().all():
-        session_rows = await sessions_for_stream_on_date(
-            session, day_gather.stream_id, gather_date
+        session_rows = await sessions_for_person_on_date(
+            session, day_gather.person_id, gather_date
         )
         if not session_rows:
             continue

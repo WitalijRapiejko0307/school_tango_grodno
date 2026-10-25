@@ -131,9 +131,9 @@ async def test_apply_gather_selection_parses_one_and_three(
     db_session.add(day_gather)
     await db_session.flush()
 
-    from app.services.gather import sessions_for_stream_on_date
+    from app.services.gather import sessions_for_person_on_date
 
-    rows = await sessions_for_stream_on_date(db_session, stream.id, gather_date)
+    rows = await sessions_for_person_on_date(db_session, person.id, gather_date)
     assert len(rows) >= 1
     now = datetime(2026, 6, 2, 7, 0, tzinfo=UTC)
     ok, text = await apply_gather_selection(db_session, day_gather, [1], now)

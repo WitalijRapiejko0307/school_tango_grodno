@@ -172,6 +172,30 @@ async def lifespan(app: FastAPI):
                     "END IF; END $$"
                 )
             )
+            await conn.execute(
+                text(
+                    "ALTER TABLE day_gathers ALTER COLUMN stream_id DROP NOT NULL"
+                )
+            )
+            await conn.execute(
+                text(
+                    "ALTER TABLE day_gathers "
+                    "DROP CONSTRAINT IF EXISTS uq_day_gathers_person_stream_date"
+                )
+            )
+            await conn.execute(
+                text(
+                    "DO $$ BEGIN "
+                    "IF NOT EXISTS ("
+                    "SELECT 1 FROM pg_constraint "
+                    "WHERE conname = 'uq_day_gathers_person_date'"
+                    ") THEN "
+                    "ALTER TABLE day_gathers ADD CONSTRAINT "
+                    "uq_day_gathers_person_date "
+                    "UNIQUE (person_id, gather_date); "
+                    "END IF; END $$"
+                )
+            )
             has_alembic = await conn.execute(
                 text(
                     "SELECT 1 FROM information_schema.tables "

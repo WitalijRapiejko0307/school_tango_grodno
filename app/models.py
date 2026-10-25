@@ -387,9 +387,8 @@ class DayGather(Base):
     __table_args__ = (
         UniqueConstraint(
             "person_id",
-            "stream_id",
             "gather_date",
-            name="uq_day_gathers_person_stream_date",
+            name="uq_day_gathers_person_date",
         ),
     )
 
@@ -397,8 +396,8 @@ class DayGather(Base):
     person_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("persons.id"), nullable=False
     )
-    stream_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("streams.id"), nullable=False
+    stream_id: Mapped[str | None] = mapped_column(
+        String(36), ForeignKey("streams.id"), nullable=True
     )
     gather_date: Mapped[date] = mapped_column(Date, nullable=False)
     sent_at: Mapped[datetime | None] = mapped_column(

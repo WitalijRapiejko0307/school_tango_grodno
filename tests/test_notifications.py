@@ -191,7 +191,7 @@ async def test_list_today_gather_summary_shows_morning_and_nudge(
     assert len(summary) == 1
     _gather, shown, detail = summary[0]
     assert shown.full_name == person.full_name
-    assert detail == "поток «Вечер», идёт: 19:00 «Tango A»"
+    assert detail == "идёт: 19:00 «Tango A»"
 
 
 async def test_guest_not_coming_cancels_rsvp_and_sets_declined(
