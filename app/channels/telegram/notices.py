@@ -11,7 +11,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db import async_session_maker
-from app.models import GuestRsvp, Person, Reminder, SchoolSession
+from app.models import DayGather, GuestRsvp, Person, SchoolSession
 from app.services.notices import (
     cancel_notice_text,
     cancel_session,
@@ -21,10 +21,10 @@ from app.services.notices import (
     reschedule_notice_text,
     reschedule_session,
 )
+from app.services.gather import list_today_gather_summary
 from app.services.notifications import (
     guest_day_summary,
     guest_rsvp,
-    list_today_session_reminder_summary,
 )
 from app.services.pick_list import HINT_MANY, PickRow, page_text, short_report
 from app.services.school_time import format_school_datetime
@@ -103,7 +103,7 @@ async def _build_rows_reminders(
     if not day_raw:
         return []
     day = date.fromisoformat(str(day_raw))
-    summary = await list_today_session_reminder_summary(session, day)
+    summary = await list_today_gather_summary(session, day)
     by_rem = {rem.id: (rem, person, detail) for rem, person, detail in summary}
     rows: list[PickRow] = []
     for rem_id in _pick_ids_from_data(data):
@@ -133,7 +133,7 @@ async def _notice_recipient_guests(
 async def _notice_recipient_reminders(
     session: AsyncSession, row: PickRow
 ) -> Person | None:
-    rem = await session.get(Reminder, row.id)
+    rem = await session.get(DayGather, row.id)
     if rem is None:
         return None
     return await session.get(Person, rem.person_id)
@@ -414,7 +414,7 @@ async def menu_reminders(message: Message, state: FSMContext) -> None:
         if await _require_admin_message(message, session) is None:
             return
         today = _today_local()
-        summary = await list_today_session_reminder_summary(session, today)
+        summary = await list_today_gather_summary(session, today)
         if not summary:
             await message.answer("На сегодня реакций на напоминания пока нет.")
             return

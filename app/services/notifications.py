@@ -246,7 +246,6 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
     await materialize_range(session, local_today, local_today + timedelta(days=2))
 
     due: list[DueReminder] = []
-    lead = timedelta(hours=START_LEAD_HOURS)
     nudge_after = timedelta(hours=NUDGE_AFTER_HOURS)
 
     sessions_result = await session.execute(
@@ -255,42 +254,6 @@ async def plan_due(session: AsyncSession, now: datetime) -> list[DueReminder]:
         .where(SchoolSession.status == "scheduled")
     )
     scheduled_sessions = list(sessions_result.all())
-    for school_session, group in scheduled_sessions:
-        starts_at = _as_aware(school_session.starts_at)
-        if now < starts_at - lead or now >= starts_at:
-            continue
-        memberships = await session.execute(
-            select(GroupMembership).where(
-                GroupMembership.group_id == school_session.group_id,
-                GroupMembership.ended_on.is_(None),
-            )
-        )
-        for membership in memberships.scalars().all():
-            member = await session.get(Person, membership.person_id)
-            if member is None or member.telegram_user_id is None:
-                continue
-            reminder = await _find_reminder(
-                session,
-                membership.person_id,
-                "session_start",
-                session_id=school_session.id,
-            )
-            if reminder is None:
-                reminder = Reminder(
-                    person_id=membership.person_id,
-                    kind="session_start",
-                    session_id=school_session.id,
-                )
-                session.add(reminder)
-                await session.flush()
-            if reminder.sent_at is not None:
-                continue
-            person, _ = await _person_telegram(session, membership.person_id)
-            text = (
-                f"Занятие группы «{group.name}»: {format_school_datetime(school_session.starts_at)}, "
-                f"место — {school_session.place}."
-            )
-            due.append(_due_from_reminder(reminder, person, text))
 
     coming_result = await session.execute(
         select(Reminder, SchoolSession)

@@ -19,6 +19,7 @@ from app.models import (
     GroupMembership,
     Person,
     SchoolSession,
+    Stream,
 )
 from app.services.notifications import record_coming
 from app.services.schedule import materialize_range
@@ -316,6 +317,52 @@ async def find_pending_day_gather(
         .order_by(DayGather.sent_at.desc())
     )
     return result.scalars().first()
+
+
+def _gather_status_ru(day_gather: DayGather, chosen: str) -> str:
+    if day_gather.response == DayGatherResponse.COMING:
+        return f"идёт: {chosen}" if chosen else "идёт"
+    if day_gather.response == DayGatherResponse.DECLINED:
+        return "не идёт"
+    if day_gather.nudge_sent_at is not None:
+        return "ответа нет, повтор отправлен"
+    return "ответа нет, повтор ещё не отправлен"
+
+
+async def list_today_gather_summary(
+    session: AsyncSession, day: date
+) -> list[tuple[DayGather, Person, str]]:
+    """Morning gather rows for the admin reminders screen on ``day``."""
+    result = await session.execute(
+        select(DayGather, Person, Stream)
+        .join(Person, DayGather.person_id == Person.id)
+        .join(Stream, DayGather.stream_id == Stream.id)
+        .where(DayGather.gather_date == day)
+        .order_by(Person.full_name, Stream.name)
+    )
+    rows: list[tuple[DayGather, Person, str]] = []
+    for day_gather, person, stream in result.all():
+        chosen = ""
+        if day_gather.selected_session_ids:
+            ids = [
+                part.strip()
+                for part in day_gather.selected_session_ids.split(",")
+                if part.strip()
+            ]
+            if ids:
+                sessions = await session.execute(
+                    select(SchoolSession, Group)
+                    .join(Group, SchoolSession.group_id == Group.id)
+                    .where(SchoolSession.id.in_(ids))
+                )
+                parts = [
+                    f"{format_school_time(school_session.starts_at)} «{group.name}»"
+                    for school_session, group in sessions.all()
+                ]
+                chosen = ", ".join(parts)
+        detail = f"поток «{stream.name}», {_gather_status_ru(day_gather, chosen)}"
+        rows.append((day_gather, person, detail))
+    return rows
 
 
 async def process_due_gathers(

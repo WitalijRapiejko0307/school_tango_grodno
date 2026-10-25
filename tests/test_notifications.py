@@ -24,7 +24,6 @@ from app.services.notifications import (
     answer_attendance,
     build_admin_session_summary_text,
     find_today_own_session_conflict,
-    list_today_session_reminder_lines,
     mark_sent,
     plan_due,
     guest_rsvp,
@@ -83,19 +82,10 @@ async def test_session_start_inside_lead_window_not_after_start(
 
     inside = starts - timedelta(hours=2)
     due = await plan_due(db_session, inside)
-    kinds = [d for d in due if d.person_id == person.id]
-    assert len(kinds) == 1
-    assert kinds[0].kind == "session_start"
-    assert kinds[0].school_session_id == school_session.id
-    assert kinds[0].person_role == "client"
-    assert "Tango A" in kinds[0].text
-    assert "15.06.2026 20:00" in kinds[0].text
-
-    after_start = starts + timedelta(minutes=5)
-    due_after = await plan_due(db_session, after_start)
     assert not [
-        d for d in due_after if d.kind == "session_start" and d.person_id == person.id
+        d for d in due if d.kind == "session_start" and d.person_id == person.id
     ]
+    assert school_session.id
 
 
 async def test_record_not_coming_skips_attendance_ask_and_no_attendance(
@@ -156,12 +146,16 @@ async def test_record_not_coming_skips_attendance_ask_and_no_attendance(
     assert sub.lessons_left == lessons_before
 
 
-async def test_list_today_session_reminder_lines_filters_and_formats(
+async def test_list_today_gather_summary_shows_morning_and_nudge(
     db_session: AsyncSession,
 ) -> None:
+    from app.models import DayGather, DayGatherResponse
+    from app.services.gather import list_today_gather_summary
+    from app.services.schedule import create_stream, set_group_stream
+
     person, group_id = await _client_in_group(db_session)
-    group = await db_session.get(Group, group_id)
-    assert group is not None
+    stream = await create_stream(db_session, "Вечер")
+    await set_group_stream(db_session, group_id, stream.id)
     today_starts = datetime(2026, 10, 2, 19, 0, tzinfo=MINSK)
     today_session = await create_session(
         db_session,
@@ -171,38 +165,33 @@ async def test_list_today_session_reminder_lines_filters_and_formats(
         place="Studio",
         bring_notes=None,
     )
-    yesterday_starts = datetime(2026, 10, 1, 19, 0, tzinfo=MINSK)
-    yesterday_session = await create_session(
-        db_session,
-        group_id,
-        starts_at=yesterday_starts,
-        ends_at=yesterday_starts + timedelta(hours=1),
-        place="Studio",
-        bring_notes=None,
-    )
     db_session.add(
-        Reminder(
+        DayGather(
             person_id=person.id,
-            kind="session_start",
-            session_id=today_session.id,
-            response=ReminderResponse.COMING,
+            stream_id=stream.id,
+            gather_date=date(2026, 10, 2),
+            sent_at=datetime(2026, 10, 2, 6, 5, tzinfo=MINSK),
+            response=DayGatherResponse.COMING,
+            selected_session_ids=today_session.id,
+            nudge_sent_at=None,
         )
     )
     db_session.add(
-        Reminder(
+        DayGather(
             person_id=person.id,
-            kind="session_start",
-            session_id=yesterday_session.id,
-            response=ReminderResponse.DECLINED,
+            stream_id=stream.id,
+            gather_date=date(2026, 10, 1),
+            sent_at=datetime(2026, 10, 1, 6, 5, tzinfo=MINSK),
+            response=DayGatherResponse.NONE,
         )
     )
     await db_session.flush()
 
-    lines = await list_today_session_reminder_lines(db_session, date(2026, 10, 2))
-    assert len(lines) == 1
-    assert lines[0] == (
-        f"Client — идёт, группа «{group.name}», 02.10.2026 19:00"
-    )
+    summary = await list_today_gather_summary(db_session, date(2026, 10, 2))
+    assert len(summary) == 1
+    _gather, shown, detail = summary[0]
+    assert shown.full_name == person.full_name
+    assert detail == "поток «Вечер», идёт: 19:00 «Tango A»"
 
 
 async def test_guest_not_coming_cancels_rsvp_and_sets_declined(
