@@ -130,3 +130,10 @@ class GroupRenameFSM(StatesGroup):
 class TabelFSM(StatesGroup):
     date_from = State()
     date_to = State()
+
+
+class PersonVisitFSM(StatesGroup):
+    date = State()
+    time = State()
+    pick = State()
+    edit_index = State()

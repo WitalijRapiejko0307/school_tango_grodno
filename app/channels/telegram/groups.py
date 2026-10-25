@@ -29,7 +29,7 @@ from app.models import (
     Stream,
     WeeklySlot,
 )
-from app.services.attendance import mark_attendance
+from app.services.attendance import mark_attendance, unmark_attendance
 from app.services.attendance_sheet import build_group_attendance_workbook
 from app.services.notices import (
     cancel_notice_text,
@@ -486,7 +486,7 @@ async def _on_many_pick_att(
             )
             existing = att_result.scalar_one_or_none()
             if existing is not None:
-                await session.delete(existing)
+                await unmark_attendance(session, person.id, school_session_id)
                 outcome = "снят"
             else:
                 await mark_attendance(

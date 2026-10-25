@@ -1,4 +1,4 @@
-from datetime import date
+from datetime import date, timedelta
 from decimal import Decimal
 
 import pytest
@@ -397,6 +397,59 @@ async def test_full_payment_is_paid(db_session: AsyncSession) -> None:
     await db_session.refresh(sub)
     assert subscription_payment_status(sub) == "paid"
     assert sub.amount_paid == Decimal("110.00")
+
+
+async def test_active_subscription_respects_starts_on(
+    db_session: AsyncSession,
+) -> None:
+    person = Person(full_name="Client", role="client")
+    db_session.add(person)
+    await db_session.flush()
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=60,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 6, 1),
+        starts_on=date(2026, 6, 15),
+    )
+    assert await active_subscription(db_session, person.id, date(2026, 6, 10)) is None
+    found = await active_subscription(db_session, person.id, date(2026, 6, 15))
+    assert found is not None
+    assert found.id == sub.id
+
+
+async def test_open_subscription_allows_past_starts_on(
+    db_session: AsyncSession,
+) -> None:
+    person = Person(full_name="Client", role="client")
+    db_session.add(person)
+    await db_session.flush()
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=8,
+        validity_days=60,
+    )
+    past = date(2020, 3, 1)
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=past,
+        starts_on=past,
+        amount_due=Decimal("100.00"),
+        amount_paid=Decimal("100.00"),
+    )
+    assert sub.starts_on == past
+    assert sub.valid_until == past + timedelta(days=60)
 
 
 async def test_future_starts_on_not_counted_as_started_unpaid(

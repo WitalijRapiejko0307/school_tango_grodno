@@ -1,4 +1,4 @@
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timezone
 from decimal import Decimal
 from zoneinfo import ZoneInfo
 
@@ -8,9 +8,9 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 
 from app.db import Base
 from app.models import Attendance, DropInCharge, Group, Person, SchoolSession, Subscription
-from app.services.attendance import mark_attendance
+from app.services.attendance import find_sessions_at, mark_attendance, unmark_attendance
 from app.services.billing import create_product, open_subscription, set_price
-from app.services.schedule import create_group, create_session
+from app.services.schedule import create_group, create_session, create_weekly_slot
 
 
 @pytest.fixture
@@ -323,3 +323,133 @@ async def test_person_subscription_decrements_only_for_owner(
 
     n = await db_session.scalar(select(func.count()).select_from(DropInCharge))
     assert n == 1
+
+
+async def test_unmark_restores_subscription_lesson(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 4, 10, 20, 0, tzinfo=minsk)
+    person, school_session = await _person_and_session(db_session, ends)
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=5,
+        validity_days=30,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 4, 1),
+        starts_on=date(2026, 4, 1),
+    )
+    await mark_attendance(
+        db_session, person.id, school_session.id, "admin", marked_by_id=person.id
+    )
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 4
+
+    removed = await unmark_attendance(db_session, person.id, school_session.id)
+    assert removed is not None
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 5
+    n = await db_session.scalar(select(func.count()).select_from(Attendance))
+    assert n == 0
+
+
+async def test_unmark_removes_drop_in_charge(db_session: AsyncSession) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 5, 15, 21, 0, tzinfo=minsk)
+    person, school_session = await _person_and_session(db_session, ends)
+    drop_in = await create_product(db_session, "drop_in", "Visit")
+    await set_price(db_session, drop_in.id, Decimal("12.00"), date(2026, 1, 1))
+
+    await mark_attendance(
+        db_session, person.id, school_session.id, "client", marked_by_id=person.id
+    )
+    assert await db_session.scalar(select(func.count()).select_from(DropInCharge)) == 1
+
+    await unmark_attendance(db_session, person.id, school_session.id)
+    assert await db_session.scalar(select(func.count()).select_from(DropInCharge)) == 0
+    assert await db_session.scalar(select(func.count()).select_from(Attendance)) == 0
+
+
+async def test_unmark_couple_second_person_restores_once(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 9, 10, 20, 0, tzinfo=minsk)
+    primary, partner, school_session, sub = await _couple_and_session(
+        db_session, ends
+    )
+    await mark_attendance(
+        db_session, primary.id, school_session.id, "client", marked_by_id=primary.id
+    )
+    await mark_attendance(
+        db_session, partner.id, school_session.id, "client", marked_by_id=partner.id
+    )
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 4
+
+    await unmark_attendance(db_session, primary.id, school_session.id)
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 4
+
+    await unmark_attendance(db_session, partner.id, school_session.id)
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 5
+
+
+async def test_mark_ignores_subscription_before_starts_on(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 4, 5, 20, 0, tzinfo=minsk)
+    person, school_session = await _person_and_session(db_session, ends)
+    drop_in = await create_product(db_session, "drop_in", "Visit")
+    await set_price(db_session, drop_in.id, Decimal("10.00"), date(2026, 1, 1))
+    product = await create_product(
+        db_session,
+        "subscription",
+        "Pack",
+        lessons_count=5,
+        validity_days=30,
+    )
+    sub = await open_subscription(
+        db_session,
+        person.id,
+        product.id,
+        started_on=date(2026, 4, 1),
+        starts_on=date(2026, 4, 10),
+    )
+
+    await mark_attendance(
+        db_session, person.id, school_session.id, "admin", marked_by_id=person.id
+    )
+    await db_session.refresh(sub)
+    assert sub.lessons_left == 5
+    n = await db_session.scalar(select(func.count()).select_from(DropInCharge))
+    assert n == 1
+
+
+async def test_find_sessions_at_matches_local_start(
+    db_session: AsyncSession,
+) -> None:
+    group = await create_group(db_session, "Main")
+    slot = await create_weekly_slot(
+        db_session,
+        group.id,
+        weekday=date(2026, 10, 6).weekday(),
+        start_time=time(19, 0),
+        end_time=time(20, 30),
+        place="Hall",
+        notes=None,
+    )
+    assert slot is not None
+    matches = await find_sessions_at(db_session, date(2026, 10, 6), time(19, 0))
+    assert len(matches) == 1
+    assert matches[0].place == "Hall"
+    empty = await find_sessions_at(db_session, date(2026, 10, 6), time(18, 0))
+    assert empty == []

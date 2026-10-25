@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, date, datetime
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
@@ -30,6 +30,11 @@ from app.models import (
     SchoolSession,
     Subscription,
 )
+from app.services.attendance import (
+    find_sessions_at,
+    mark_attendance,
+    unmark_attendance,
+)
 from app.services.billing import (
     list_payable_subscriptions,
     person_has_unpaid_started,
@@ -45,7 +50,11 @@ from app.services.contacts import (
     restore_contact,
     update_contact,
 )
-from app.services.school_time import format_school_date, school_tz
+from app.services.school_time import (
+    format_school_date,
+    format_school_time,
+    school_tz,
+)
 from app.services.user_labels import format_person_list_detail, format_person_role_label
 from app.services.identity import demote_admin, invite_admin
 from app.services.pick_list import (
@@ -87,7 +96,12 @@ from .states import (
     PayInFSM,
     PeopleAddFSM,
     PeoplePickFSM,
+    PersonVisitFSM,
 )
+
+_VISIT_CANCEL = "отмена"
+_PROMPT_VISIT_DATE = "Дата занятия (ДД.ММ.ГГГГ):"
+_PROMPT_VISIT_TIME = "Время начала (ЧЧ:ММ):"
 
 logger = logging.getLogger(__name__)
 
@@ -127,7 +141,9 @@ def _pair_error_message(exc: ValueError) -> str:
     return _PAIR_ERROR_RU.get(str(exc), "Не удалось изменить пару.")
 
 
-def _session_visit_line(session: SchoolSession) -> str:
+def _session_visit_line(
+    session: SchoolSession, group_name: str | None = None
+) -> str:
     if session.session_date is not None:
         day = session.session_date
     else:
@@ -137,7 +153,84 @@ def _session_visit_line(session: SchoolSession) -> str:
         else:
             day = starts.astimezone(school_tz()).date()
     weekday = _WEEKDAY_FULL_RU[day.weekday()]
-    return f"{weekday}, {format_school_date(day)}"
+    line = (
+        f"{weekday}, {format_school_date(day)}, "
+        f"{format_school_time(session.starts_at)}"
+    )
+    if group_name:
+        line = f"{line}, {group_name}"
+    return line
+
+
+def _parse_visit_date(text: str) -> date:
+    return datetime.strptime(text.strip(), "%d.%m.%Y").date()
+
+
+def _parse_visit_time(text: str) -> time:
+    return datetime.strptime(text.strip(), "%H:%M").time()
+
+
+def _visits_keyboard(person_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Добавить",
+                    callback_data=f"ppl_visit_add:{person_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Изменить",
+                    callback_data=f"ppl_visit_edit:{person_id}",
+                )
+            ],
+        ]
+    )
+
+
+def _visit_confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Да",
+                    callback_data=f"ppl_visit_yes:{session_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="ppl_visit_cancel",
+                )
+            ],
+        ]
+    )
+
+
+def _visit_edit_action_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Перенести",
+                    callback_data="ppl_visit_move",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Удалить",
+                    callback_data="ppl_visit_del",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="ppl_visit_cancel",
+                )
+            ],
+        ]
+    )
 
 
 def _subscription_period_label(sub: Subscription) -> str:
@@ -936,20 +1029,168 @@ async def _format_person_subscriptions(
     return "\n".join(lines), kb
 
 
-async def _format_person_visits(session: AsyncSession, person_id: str) -> str:
+async def _person_visit_rows(
+    session: AsyncSession, person_id: str
+) -> list[tuple[Attendance, SchoolSession, str]]:
     result = await session.execute(
-        select(Attendance, SchoolSession)
+        select(Attendance, SchoolSession, Group)
         .join(SchoolSession, Attendance.session_id == SchoolSession.id)
+        .join(Group, SchoolSession.group_id == Group.id)
         .where(Attendance.person_id == person_id)
         .order_by(desc(SchoolSession.starts_at))
     )
-    rows = result.all()
+    return [
+        (att, school_session, group.name)
+        for att, school_session, group in result.all()
+    ]
+
+
+async def _format_person_visits(session: AsyncSession, person_id: str) -> str:
+    rows = await _person_visit_rows(session, person_id)
     if not rows:
         return "Посещений нет."
     lines = ["Посещения:"]
-    for _att, school_session in rows:
-        lines.append(f"• {_session_visit_line(school_session)}")
+    for _att, school_session, group_name in rows:
+        lines.append(f"• {_session_visit_line(school_session, group_name)}")
     return "\n".join(lines)
+
+
+async def _format_person_visits_numbered(
+    session: AsyncSession, person_id: str
+) -> tuple[str, list[str]]:
+    rows = await _person_visit_rows(session, person_id)
+    if not rows:
+        return "Посещений нет.", []
+    session_ids = [school_session.id for _att, school_session, _g in rows]
+    lines = ["Посещения (номер для изменения):"]
+    for index, (_att, school_session, group_name) in enumerate(rows, start=1):
+        lines.append(
+            f"{index}. {_session_visit_line(school_session, group_name)}"
+        )
+    return "\n".join(lines), session_ids
+
+
+async def _session_label(session: AsyncSession, school_session_id: str) -> str:
+    school_session = await session.get(SchoolSession, school_session_id)
+    if school_session is None:
+        return "занятие"
+    group = await session.get(Group, school_session.group_id)
+    name = group.name if group is not None else "?"
+    return _session_visit_line(school_session, name)
+
+
+async def _clear_visit_cancel(message: Message, state: FSMContext) -> bool:
+    if message.text and message.text.strip().lower() == _VISIT_CANCEL:
+        await state.clear()
+        await message.answer("Отменено.")
+        return True
+    return False
+
+
+async def _ask_visit_confirm(
+    message: Message,
+    state: FSMContext,
+    session: AsyncSession,
+    school_session_id: str,
+) -> None:
+    label = await _session_label(session, school_session_id)
+    data = await state.get_data()
+    mode = data.get("visit_mode", "add")
+    if mode == "move":
+        prompt = f"Перенести на: {label}?"
+    else:
+        prompt = f"Отметить: {label}?"
+    await message.answer(prompt, reply_markup=_visit_confirm_keyboard(school_session_id))
+
+
+async def _resolve_visit_sessions(
+    message: Message,
+    state: FSMContext,
+    on_date: date,
+    at_time: time,
+) -> None:
+    async with async_session_maker() as session:
+        matches = await find_sessions_at(session, on_date, at_time)
+        if not matches:
+            await message.answer("Занятие не найдено. Введите дату ещё раз или «отмена».")
+            await state.set_state(PersonVisitFSM.date)
+            return
+        if len(matches) == 1:
+            await _ask_visit_confirm(message, state, session, matches[0].id)
+            return
+        lines = ["Несколько занятий, отправьте номер:"]
+        ids: list[str] = []
+        for index, school_session in enumerate(matches, start=1):
+            group = await session.get(Group, school_session.group_id)
+            name = group.name if group is not None else "?"
+            lines.append(f"{index}. {_session_visit_line(school_session, name)}")
+            ids.append(school_session.id)
+        await state.update_data(visit_pick_ids=ids)
+        await state.set_state(PersonVisitFSM.pick)
+        await message.answer("\n".join(lines))
+
+
+async def _apply_visit_confirm(
+    message: Message,
+    state: FSMContext,
+    *,
+    admin_id: str,
+    person_id: str,
+    school_session_id: str,
+    mode: str,
+    old_session_id: str | None,
+) -> None:
+    async with async_session_maker() as session:
+        try:
+            if mode == "move":
+                if not old_session_id:
+                    await message.answer("Не удалось перенести.")
+                    await state.clear()
+                    return
+                if old_session_id == school_session_id:
+                    await message.answer("Это то же занятие.")
+                    await state.clear()
+                    return
+                existing_new = await session.execute(
+                    select(Attendance).where(
+                        Attendance.person_id == person_id,
+                        Attendance.session_id == school_session_id,
+                    )
+                )
+                if existing_new.scalar_one_or_none() is not None:
+                    await message.answer("На новом занятии уже есть отметка.")
+                    await state.clear()
+                    return
+                removed = await unmark_attendance(
+                    session, person_id, old_session_id
+                )
+                if removed is None:
+                    await message.answer("Старое посещение не найдено.")
+                    await state.clear()
+                    return
+            await mark_attendance(
+                session,
+                person_id,
+                school_session_id,
+                "admin",
+                marked_by_id=admin_id,
+            )
+            await session.commit()
+            text = await _format_person_visits(session, person_id)
+        except ValueError as exc:
+            await session.rollback()
+            err = str(exc)
+            if "not activated" in err:
+                await message.answer("Человек ещё не в боте — отметить нельзя.")
+            elif "not scheduled" in err:
+                await message.answer("Занятие отменено.")
+            else:
+                await message.answer("Не удалось отметить посещение.")
+            await state.clear()
+            return
+    await state.clear()
+    verb = "Перенесено." if mode == "move" else "Отмечено."
+    await message.answer(f"{verb}\n\n{text}", reply_markup=_visits_keyboard(person_id))
 
 
 def _parse_payment_amount(text: str) -> Decimal:
@@ -1031,7 +1272,251 @@ async def cb_ppl_visits(query: CallbackQuery) -> None:
         text = await _format_person_visits(session, person_id)
     await query.answer()
     if query.message:
-        await query.message.answer(text)
+        await query.message.answer(text, reply_markup=_visits_keyboard(person_id))
+
+
+@router.callback_query(F.data.startswith("ppl_visit_add:"))
+async def cb_ppl_visit_add(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    await state.clear()
+    await state.update_data(visit_mode="add", visit_person_id=person_id)
+    await state.set_state(PersonVisitFSM.date)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            f"{_PROMPT_VISIT_DATE}\nИли «отмена»."
+        )
+
+
+@router.callback_query(F.data.startswith("ppl_visit_edit:"))
+async def cb_ppl_visit_edit(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    person_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        text, session_ids = await _format_person_visits_numbered(session, person_id)
+    await query.answer()
+    if not session_ids:
+        if query.message:
+            await query.message.answer(text, reply_markup=_visits_keyboard(person_id))
+        return
+    await state.clear()
+    await state.update_data(
+        visit_mode="edit",
+        visit_person_id=person_id,
+        visit_edit_ids=session_ids,
+    )
+    await state.set_state(PersonVisitFSM.edit_index)
+    if query.message:
+        await query.message.answer(f"{text}\n\nНомер или «отмена».")
+
+
+@router.callback_query(F.data == "ppl_visit_cancel")
+async def cb_ppl_visit_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    data = await state.get_data()
+    person_id = data.get("visit_person_id")
+    await state.clear()
+    await query.answer()
+    if query.message:
+        if person_id:
+            async with async_session_maker() as session:
+                text = await _format_person_visits(session, str(person_id))
+            await query.message.answer(
+                f"Отменено.\n\n{text}",
+                reply_markup=_visits_keyboard(str(person_id)),
+            )
+        else:
+            await query.message.answer("Отменено.")
+
+
+@router.callback_query(F.data.startswith("ppl_visit_yes:"))
+async def cb_ppl_visit_yes(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.from_user is None:
+        return
+    school_session_id = query.data.split(":", 1)[1]
+    admin = await _require_admin_callback(query)
+    if admin is None:
+        return
+    data = await state.get_data()
+    person_id = data.get("visit_person_id")
+    if not person_id:
+        await state.clear()
+        await query.answer()
+        return
+    mode = str(data.get("visit_mode") or "add")
+    old_session_id = data.get("visit_old_session_id")
+    await query.answer()
+    if query.message is None:
+        return
+    await _apply_visit_confirm(
+        query.message,
+        state,
+        admin_id=admin.id,
+        person_id=str(person_id),
+        school_session_id=school_session_id,
+        mode=mode if mode in ("add", "move") else "add",
+        old_session_id=str(old_session_id) if old_session_id else None,
+    )
+
+
+@router.callback_query(F.data == "ppl_visit_del")
+async def cb_ppl_visit_del(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    data = await state.get_data()
+    person_id = data.get("visit_person_id")
+    old_session_id = data.get("visit_old_session_id")
+    if not person_id or not old_session_id:
+        await state.clear()
+        await query.answer()
+        return
+    async with async_session_maker() as session:
+        removed = await unmark_attendance(
+            session, str(person_id), str(old_session_id)
+        )
+        if removed is None:
+            await session.rollback()
+            await state.clear()
+            await query.answer()
+            if query.message:
+                await query.message.answer("Посещение не найдено.")
+            return
+        await session.commit()
+        text = await _format_person_visits(session, str(person_id))
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            f"Удалено.\n\n{text}",
+            reply_markup=_visits_keyboard(str(person_id)),
+        )
+
+
+@router.callback_query(F.data == "ppl_visit_move")
+async def cb_ppl_visit_move(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    data = await state.get_data()
+    person_id = data.get("visit_person_id")
+    old_session_id = data.get("visit_old_session_id")
+    if not person_id or not old_session_id:
+        await state.clear()
+        await query.answer()
+        return
+    await state.update_data(visit_mode="move")
+    await state.set_state(PersonVisitFSM.date)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            f"Новая дата занятия.\n{_PROMPT_VISIT_DATE}\nИли «отмена»."
+        )
+
+
+@router.message(PersonVisitFSM.date)
+async def fsm_visit_date(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if await _clear_visit_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        on_date = _parse_visit_date(message.text)
+    except ValueError:
+        await message.answer("Формат: ДД.ММ.ГГГГ")
+        return
+    await state.update_data(visit_date=on_date.isoformat())
+    await state.set_state(PersonVisitFSM.time)
+    await message.answer(_PROMPT_VISIT_TIME)
+
+
+@router.message(PersonVisitFSM.time)
+async def fsm_visit_time(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if await _clear_visit_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        at_time = _parse_visit_time(message.text)
+    except ValueError:
+        await message.answer("Формат: ЧЧ:ММ")
+        return
+    data = await state.get_data()
+    raw_date = data.get("visit_date")
+    if not raw_date:
+        await state.clear()
+        return
+    on_date = date.fromisoformat(str(raw_date))
+    await _resolve_visit_sessions(message, state, on_date, at_time)
+
+
+@router.message(PersonVisitFSM.pick)
+async def fsm_visit_pick(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if await _clear_visit_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    data = await state.get_data()
+    ids = data.get("visit_pick_ids") or []
+    try:
+        index = int(message.text.strip())
+    except ValueError:
+        await message.answer("Отправьте номер из списка.")
+        return
+    if index < 1 or index > len(ids):
+        await message.answer("Номер вне списка.")
+        return
+    school_session_id = str(ids[index - 1])
+    async with async_session_maker() as session:
+        await _ask_visit_confirm(message, state, session, school_session_id)
+
+
+@router.message(PersonVisitFSM.edit_index)
+async def fsm_visit_edit_index(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if await _clear_visit_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    data = await state.get_data()
+    ids = data.get("visit_edit_ids") or []
+    try:
+        index = int(message.text.strip())
+    except ValueError:
+        await message.answer("Отправьте номер из списка.")
+        return
+    if index < 1 or index > len(ids):
+        await message.answer("Номер вне списка.")
+        return
+    old_session_id = str(ids[index - 1])
+    await state.update_data(visit_old_session_id=old_session_id)
+    async with async_session_maker() as session:
+        label = await _session_label(session, old_session_id)
+    await message.answer(
+        f"{label}\nПеренести или удалить?",
+        reply_markup=_visit_edit_action_keyboard(),
+    )
 
 
 @router.callback_query(F.data.startswith("ppl_pays:"))

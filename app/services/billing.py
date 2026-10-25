@@ -19,6 +19,22 @@ def _validate_audience(audience: str) -> None:
         raise ValueError(f"audience must be one of: person, couple")
 
 
+def subscription_covers_date(sub: Subscription, on_date: date) -> bool:
+    if sub.starts_on is not None and on_date < sub.starts_on:
+        return False
+    if sub.valid_until is not None and on_date > sub.valid_until:
+        return False
+    return True
+
+
+def _starts_on_clause(on_date: date):
+    return (Subscription.starts_on.is_(None)) | (Subscription.starts_on <= on_date)
+
+
+def _valid_until_clause(on_date: date):
+    return (Subscription.valid_until.is_(None)) | (Subscription.valid_until >= on_date)
+
+
 async def _has_active_couple_subscription(
     session: AsyncSession,
     person_id: str,
@@ -34,8 +50,8 @@ async def _has_active_couple_subscription(
                 Subscription.partner_id == person_id,
             ),
             Subscription.lessons_left > 0,
-            (Subscription.valid_until.is_(None))
-            | (Subscription.valid_until >= on_date),
+            _starts_on_clause(on_date),
+            _valid_until_clause(on_date),
         )
         .limit(1)
     )
@@ -158,8 +174,8 @@ async def list_payable_subscriptions(
                 Subscription.partner_id == person_id,
             ),
             Subscription.lessons_left > 0,
-            (Subscription.valid_until.is_(None))
-            | (Subscription.valid_until >= on_date),
+            _starts_on_clause(on_date),
+            _valid_until_clause(on_date),
         )
         .order_by(Subscription.valid_until.asc().nullsfirst())
     )
@@ -320,13 +336,35 @@ async def active_subscription(
                 Subscription.partner_id == person_id,
             ),
             Subscription.lessons_left > 0,
-            (Subscription.valid_until.is_(None))
-            | (Subscription.valid_until >= on_date),
+            _starts_on_clause(on_date),
+            _valid_until_clause(on_date),
         )
         .order_by(Subscription.valid_until.asc().nullsfirst())
         .limit(1)
     )
     return result.scalar_one_or_none()
+
+
+async def covering_subscription_for_refund(
+    session: AsyncSession, person_id: str, on_date: date
+) -> Subscription | None:
+    """Subscription that covered on_date, even if lessons_left is already 0."""
+    result = await session.execute(
+        select(Subscription)
+        .where(
+            or_(
+                Subscription.person_id == person_id,
+                Subscription.partner_id == person_id,
+            ),
+            _starts_on_clause(on_date),
+            _valid_until_clause(on_date),
+        )
+        .order_by(Subscription.valid_until.asc().nullsfirst())
+    )
+    for sub in result.scalars().all():
+        if subscription_covers_date(sub, on_date):
+            return sub
+    return None
 
 
 async def _get_product(session: AsyncSession, product_id: str) -> Product:

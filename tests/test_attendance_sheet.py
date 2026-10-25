@@ -11,7 +11,7 @@ from app.db import Base
 from app.models import Person
 from app.services.attendance import mark_attendance
 from app.services.attendance_sheet import build_group_attendance_workbook
-from app.services.billing import create_product, open_subscription
+from app.services.billing import create_product, open_subscription, set_price
 from app.services.schedule import assign_group, create_group, create_session
 
 MINSK = ZoneInfo("Europe/Minsk")
@@ -36,6 +36,8 @@ async def test_visit_numbers_restart_on_next_subscription(db_session: AsyncSessi
     db_session.add(person)
     await db_session.flush()
     await assign_group(db_session, person.id, group.id, date(2026, 9, 1))
+    drop_in = await create_product(db_session, "drop_in", "Разовое")
+    await set_price(db_session, drop_in.id, Decimal("15.00"), date(2026, 1, 1))
     product = await create_product(
         db_session, "subscription", "8 занятий", lessons_count=8, validity_days=28
     )

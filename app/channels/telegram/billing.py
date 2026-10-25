@@ -62,7 +62,9 @@ router.message.middleware(_BlockArchivedMiddleware())
 router.callback_query.middleware(_BlockArchivedMiddleware())
 
 _OPEN_SUB_CANCEL = "отмена"
-_PROMPT_START_DATE = "Дата начала абонемента (ДД.ММ.ГГГГ):"
+_PROMPT_START_DATE = (
+    "Дата начала абонемента (ДД.ММ.ГГГГ), можно в прошлом:"
+)
 _PROMPT_PAYMENT = "Оплата: да / частично / нет"
 _PROMPT_PARTIAL_AMOUNT = "Сумма оплаты (число, запятая или точка):"
 
