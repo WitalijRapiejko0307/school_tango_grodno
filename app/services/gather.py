@@ -43,7 +43,7 @@ _GATHER_REPLY_RE = re.compile(r"^\s*\d+(?:\s*,\s*\d+)*\s*$")
 def nudge_deadline(
     morning_sent_at: datetime, earliest_session_start: datetime
 ) -> datetime | None:
-    """Latest time to send a nudge after the morning gather message."""
+    """Planned nudge time: six hours after the morning message, not later than three hours before class."""
     if morning_sent_at.tzinfo is None or earliest_session_start.tzinfo is None:
         raise ValueError("datetimes must be timezone-aware")
 
@@ -53,6 +53,24 @@ def nudge_deadline(
     if nudge_at <= morning_sent_at:
         return None
     return nudge_at
+
+
+def nudge_is_due(
+    morning_sent_at: datetime, earliest_session_start: datetime, now: datetime
+) -> bool:
+    """True when a non-responder should get the repeat now.
+
+    The planned moment is six hours after the morning message, capped at three
+    hours before class. If that moment was missed, the repeat still goes out
+    until the class starts. A morning message sent after the cap gets the
+    repeat an hour later, still before the class.
+    """
+    if now >= earliest_session_start:
+        return False
+    deadline = nudge_deadline(morning_sent_at, earliest_session_start)
+    if deadline is not None:
+        return now >= deadline
+    return now >= morning_sent_at + timedelta(hours=1)
 
 
 def _as_aware(dt: datetime) -> datetime:
@@ -69,6 +87,16 @@ def in_morning_gather_window(now: datetime) -> bool:
     """True during 09:00–09:59:59 school local time."""
     local = _as_aware(now).astimezone(school_tz())
     return local.hour == 9
+
+
+def morning_gather_due(now: datetime) -> bool:
+    """True from 09:00 school local time until the end of that day.
+
+    The first attempt is the 09:00 hour. Later checks send the same message
+    immediately if that hour was missed.
+    """
+    local = _as_aware(now).astimezone(school_tz())
+    return local.hour >= 9
 
 
 def parse_gather_indexes(text: str) -> list[int] | None:
@@ -370,12 +398,17 @@ async def process_due_gathers(
 ) -> None:
     gather_date = local_school_date(now)
 
-    if in_morning_gather_window(now):
+    if morning_gather_due(now):
         for stream_id in await _stream_ids_with_sessions_today(session, gather_date):
             session_rows = await sessions_for_stream_on_date(
                 session, stream_id, gather_date
             )
             if not session_rows:
+                continue
+            if all(
+                _as_aware(row.school_session.starts_at) <= _as_aware(now)
+                for row in session_rows
+            ):
                 continue
             for person in await _eligible_persons_for_stream(session, stream_id):
                 if await _existing_day_gather(
@@ -406,14 +439,20 @@ async def process_due_gathers(
         )
         if not session_rows:
             continue
+        upcoming = [
+            row
+            for row in session_rows
+            if _as_aware(row.school_session.starts_at) > _as_aware(now)
+        ]
+        if not upcoming:
+            continue
         earliest = min(
-            _as_aware(r.school_session.starts_at) for r in session_rows
+            _as_aware(row.school_session.starts_at) for row in upcoming
         )
         sent_at = day_gather.sent_at
         if sent_at is None:
             continue
-        nudge_at = nudge_deadline(_as_aware(sent_at), earliest)
-        if nudge_at is None or now < nudge_at:
+        if not nudge_is_due(_as_aware(sent_at), earliest, _as_aware(now)):
             continue
         person = await session.get(Person, day_gather.person_id)
         if person is None or person.telegram_user_id is None:

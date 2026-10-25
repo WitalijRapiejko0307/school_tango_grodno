@@ -10,7 +10,9 @@ from app.models import DayGather, Group, GroupMembership, Person
 from app.services.gather import (
     apply_gather_selection,
     in_morning_gather_window,
+    morning_gather_due,
     nudge_deadline,
+    nudge_is_due,
     parse_gather_indexes,
     process_due_gathers,
     validate_gather_indexes,
@@ -57,6 +59,23 @@ def test_nudge_deadline_too_close_to_morning() -> None:
     morning = datetime(2026, 6, 1, 9, 0, tzinfo=TZ)
     class_start = datetime(2026, 6, 1, 11, 0, tzinfo=TZ)
     assert nudge_deadline(morning, class_start) is None
+
+
+def test_nudge_catch_up_after_missed_slot_and_after_late_morning() -> None:
+    morning = datetime(2026, 6, 1, 9, 0, tzinfo=TZ)
+    class_start = datetime(2026, 6, 1, 16, 0, tzinfo=TZ)
+    assert not nudge_is_due(morning, class_start, datetime(2026, 6, 1, 12, 0, tzinfo=TZ))
+    assert nudge_is_due(morning, class_start, datetime(2026, 6, 1, 14, 0, tzinfo=TZ))
+    assert not nudge_is_due(morning, class_start, class_start)
+
+    late_morning = datetime(2026, 6, 1, 13, 30, tzinfo=TZ)
+    assert nudge_deadline(late_morning, class_start) is None
+    assert not nudge_is_due(
+        late_morning, class_start, datetime(2026, 6, 1, 14, 0, tzinfo=TZ)
+    )
+    assert nudge_is_due(
+        late_morning, class_start, datetime(2026, 6, 1, 14, 30, tzinfo=TZ)
+    )
 
 
 def test_parse_gather_indexes() -> None:
@@ -155,3 +174,61 @@ async def test_morning_window_sends_only_once(db_session: AsyncSession) -> None:
     assert bot.send_message.await_count == 1
     result = await db_session.execute(select(DayGather))
     assert len(list(result.scalars().all())) == 1
+
+
+@pytest.mark.asyncio
+async def test_missed_morning_hour_sends_while_class_is_ahead(
+    db_session: AsyncSession,
+) -> None:
+    stream = await create_stream(db_session, "Вечер")
+    group = await create_group(db_session, "Группа")
+    await set_group_stream(db_session, group.id, stream.id)
+    await create_weekly_slot(
+        db_session,
+        group.id,
+        3,
+        time(19, 0),
+        time(20, 0),
+        "Студия",
+        None,
+    )
+    person = Person(full_name="Ольга", role="client", telegram_user_id=77)
+    db_session.add(person)
+    await db_session.flush()
+    await assign_group(db_session, person.id, group.id, started_on=date(2026, 1, 1))
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    late = datetime(2026, 1, 15, 10, 0, tzinfo=UTC)  # 13:00 Minsk, class at 19:00
+    assert morning_gather_due(late)
+    assert not in_morning_gather_window(late)
+    await process_due_gathers(db_session, bot, late)
+    assert bot.send_message.await_count == 1
+
+
+@pytest.mark.asyncio
+async def test_missed_morning_hour_skips_after_class_started(
+    db_session: AsyncSession,
+) -> None:
+    stream = await create_stream(db_session, "День")
+    group = await create_group(db_session, "Группа")
+    await set_group_stream(db_session, group.id, stream.id)
+    await create_weekly_slot(
+        db_session,
+        group.id,
+        3,
+        time(12, 0),
+        time(13, 0),
+        "Студия",
+        None,
+    )
+    person = Person(full_name="Пётр", role="client", telegram_user_id=78)
+    db_session.add(person)
+    await db_session.flush()
+    await assign_group(db_session, person.id, group.id, started_on=date(2026, 1, 1))
+
+    bot = MagicMock()
+    bot.send_message = AsyncMock()
+    after = datetime(2026, 1, 15, 10, 30, tzinfo=UTC)  # 13:30 Minsk, class was 12:00
+    await process_due_gathers(db_session, bot, after)
+    assert bot.send_message.await_count == 0
