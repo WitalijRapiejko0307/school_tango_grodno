@@ -209,12 +209,13 @@ async def test_subscription_visit_no_drop_in_charge_decrements_once(
     assert n == 0
 
 
-async def test_unactivated_person_is_not_marked(db_session: AsyncSession) -> None:
+async def test_unactivated_person_admin_can_mark(db_session: AsyncSession) -> None:
     minsk = ZoneInfo("Europe/Minsk")
     ends = datetime(2026, 8, 1, 20, 0, tzinfo=minsk)
     person = Person(full_name="Card", role="client", telegram_user_id=None)
+    admin = Person(full_name="Admin", role="admin", telegram_user_id=9001)
     group = await create_group(db_session, "Main")
-    db_session.add(person)
+    db_session.add_all([person, admin])
     await db_session.flush()
     school_session = await create_session(
         db_session,
@@ -231,13 +232,39 @@ async def test_unactivated_person_is_not_marked(db_session: AsyncSession) -> Non
         db_session, person.id, product.id, started_on=date(2026, 7, 1)
     )
 
-    with pytest.raises(ValueError, match="not activated"):
-        await mark_attendance(
-            db_session, person.id, school_session.id, "admin", marked_by_id=person.id
-        )
+    await mark_attendance(
+        db_session, person.id, school_session.id, "admin", marked_by_id=admin.id
+    )
 
     await db_session.refresh(sub)
-    assert sub.lessons_left == 4
+    assert sub.lessons_left == 3
+    n = await db_session.scalar(select(func.count()).select_from(Attendance))
+    assert n == 1
+
+
+async def test_unactivated_person_client_mark_rejected(
+    db_session: AsyncSession,
+) -> None:
+    minsk = ZoneInfo("Europe/Minsk")
+    ends = datetime(2026, 8, 1, 20, 0, tzinfo=minsk)
+    person = Person(full_name="Card", role="client", telegram_user_id=None)
+    group = await create_group(db_session, "Main")
+    db_session.add(person)
+    await db_session.flush()
+    school_session = await create_session(
+        db_session,
+        group.id,
+        starts_at=ends.replace(hour=ends.hour - 1),
+        ends_at=ends,
+        place="Studio",
+        bring_notes=None,
+    )
+
+    with pytest.raises(ValueError, match="not activated"):
+        await mark_attendance(
+            db_session, person.id, school_session.id, "client", marked_by_id=person.id
+        )
+
     n = await db_session.scalar(select(func.count()).select_from(Attendance))
     assert n == 0
 

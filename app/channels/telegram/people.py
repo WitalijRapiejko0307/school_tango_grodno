@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import re
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal, InvalidOperation
 
 from aiogram import F, Router
@@ -74,7 +74,11 @@ from app.services.roster import (
     restore_person,
     update_person_card,
 )
-from app.services.schedule import active_group_membership, assign_group
+from app.services.schedule import (
+    active_group_membership,
+    assign_group,
+    create_adhoc_session,
+)
 
 from .common import (
     BTN_CONTACTS,
@@ -102,6 +106,8 @@ from .states import (
 _VISIT_CANCEL = "отмена"
 _PROMPT_VISIT_DATE = "Дата занятия (ДД.ММ.ГГГГ):"
 _PROMPT_VISIT_TIME = "Время начала (ЧЧ:ММ):"
+_DEFAULT_ADHOC_DURATION_MIN = 55
+_UNLINKED_NOTE = "Ещё не в боте — оповещения не шлём."
 
 logger = logging.getLogger(__name__)
 
@@ -204,6 +210,44 @@ def _visit_confirm_keyboard(session_id: str) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Да",
                     callback_data=f"ppl_visit_yes:{session_id}",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="ppl_visit_cancel",
+                )
+            ],
+        ]
+    )
+
+
+def _visit_create_offer_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Создать занятие",
+                    callback_data="ppl_visit_create",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="ppl_visit_cancel",
+                )
+            ],
+        ]
+    )
+
+
+def _visit_create_confirm_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Да",
+                    callback_data="ppl_visit_create_yes",
                 )
             ],
             [
@@ -1116,11 +1160,25 @@ async def _resolve_visit_sessions(
     on_date: date,
     at_time: time,
 ) -> None:
+    await state.update_data(
+        visit_date=on_date.isoformat(),
+        visit_time=at_time.strftime("%H:%M"),
+    )
+    data = await state.get_data()
+    mode = str(data.get("visit_mode") or "add")
     async with async_session_maker() as session:
         matches = await find_sessions_at(session, on_date, at_time)
         if not matches:
-            await message.answer("Занятие не найдено. Введите дату ещё раз или «отмена».")
-            await state.set_state(PersonVisitFSM.date)
+            if mode == "add":
+                await message.answer(
+                    "Занятие не найдено. Создать разовое и отметить?",
+                    reply_markup=_visit_create_offer_keyboard(),
+                )
+            else:
+                await message.answer(
+                    "Занятие не найдено. Введите дату ещё раз или «отмена»."
+                )
+                await state.set_state(PersonVisitFSM.date)
             return
         if len(matches) == 1:
             await _ask_visit_confirm(message, state, session, matches[0].id)
@@ -1136,6 +1194,63 @@ async def _resolve_visit_sessions(
         await state.update_data(visit_pick_ids=ids)
         await state.set_state(PersonVisitFSM.pick)
         await message.answer("\n".join(lines))
+
+
+async def _unlinked_suffix(session: AsyncSession, person_id: str) -> str:
+    person = await session.get(Person, person_id)
+    if person is None or person.telegram_user_id is not None:
+        return ""
+    return f"\n{_UNLINKED_NOTE}"
+
+
+async def _begin_visit_create(
+    message: Message,
+    state: FSMContext,
+    *,
+    group_id: str | None = None,
+) -> None:
+    data = await state.get_data()
+    person_id = data.get("visit_person_id")
+    if not person_id:
+        await state.clear()
+        await message.answer("Начните снова.")
+        return
+    async with async_session_maker() as session:
+        resolved_group_id = group_id
+        if resolved_group_id is None:
+            membership = await _active_membership(session, str(person_id))
+            if membership is not None:
+                resolved_group_id = membership.group_id
+        if resolved_group_id is None:
+            from .groups import _list_active_groups
+
+            groups = await _list_active_groups(session)
+            if not groups:
+                await message.answer("Нет активных групп — создать занятие нельзя.")
+                await state.clear()
+                return
+            if len(groups) == 1:
+                resolved_group_id = groups[0].id
+            else:
+                pick_rows = [
+                    PickRow(id=group.id, full_name=group.name) for group in groups
+                ]
+                await _start_list_pick(
+                    message,
+                    state,
+                    purpose="visit_create_grp",
+                    rows=pick_rows,
+                    title="Группа для нового занятия:",
+                    hint=HINT_INDEX,
+                )
+                return
+        group = await session.get(Group, resolved_group_id)
+        gname = group.name if group is not None else "?"
+    await state.update_data(visit_create_group_id=resolved_group_id)
+    await state.set_state(PersonVisitFSM.create_place)
+    await message.answer(
+        f"Группа: {gname}.\nМесто занятия. Или «отмена»."
+    )
 
 
 async def _apply_visit_confirm(
@@ -1185,12 +1300,11 @@ async def _apply_visit_confirm(
             )
             await session.commit()
             text = await _format_person_visits(session, person_id)
+            note = await _unlinked_suffix(session, person_id)
         except ValueError as exc:
             await session.rollback()
             err = str(exc)
-            if "not activated" in err:
-                await message.answer("Человек ещё не в боте — отметить нельзя.")
-            elif "not scheduled" in err:
+            if "not scheduled" in err:
                 await message.answer("Занятие отменено.")
             else:
                 await message.answer("Не удалось отметить посещение.")
@@ -1198,7 +1312,10 @@ async def _apply_visit_confirm(
             return
     await state.clear()
     verb = "Перенесено." if mode == "move" else "Отмечено."
-    await message.answer(f"{verb}\n\n{text}", reply_markup=_visits_keyboard(person_id))
+    await message.answer(
+        f"{verb}{note}\n\n{text}",
+        reply_markup=_visits_keyboard(person_id),
+    )
 
 
 def _parse_payment_amount(text: str) -> Decimal:
@@ -1406,6 +1523,185 @@ async def cb_ppl_visit_del(query: CallbackQuery, state: FSMContext) -> None:
             f"Удалено.\n\n{text}",
             reply_markup=_visits_keyboard(str(person_id)),
         )
+
+
+@router.callback_query(F.data == "ppl_visit_create")
+async def cb_ppl_visit_create(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    data = await state.get_data()
+    if not data.get("visit_person_id") or not data.get("visit_date") or not data.get(
+        "visit_time"
+    ):
+        await state.clear()
+        await query.answer()
+        if query.message:
+            await query.message.answer("Начните снова.")
+        return
+    mode = str(data.get("visit_mode") or "add")
+    if mode != "add":
+        await query.answer("Создание только при добавлении", show_alert=True)
+        return
+    await query.answer()
+    if query.message is None:
+        return
+    await _begin_visit_create(query.message, state)
+
+
+@router.message(PersonVisitFSM.create_place)
+async def fsm_visit_create_place(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if await _clear_visit_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    place = message.text.strip()
+    if not place:
+        await message.answer("Укажите место.")
+        return
+    await state.update_data(visit_create_place=place)
+    await state.set_state(PersonVisitFSM.create_duration)
+    await message.answer(
+        f"Длительность в минутах (по умолчанию {_DEFAULT_ADHOC_DURATION_MIN}). "
+        "Число или «отмена»."
+    )
+
+
+@router.message(PersonVisitFSM.create_duration)
+async def fsm_visit_create_duration(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if await _clear_visit_cancel(message, state):
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    raw = message.text.strip()
+    if raw == "" or raw == "—":
+        minutes = _DEFAULT_ADHOC_DURATION_MIN
+    else:
+        try:
+            minutes = int(raw)
+        except ValueError:
+            await message.answer("Введите число минут.")
+            return
+    if minutes <= 0:
+        await message.answer("Длительность должна быть больше нуля.")
+        return
+    data = await state.get_data()
+    group_id = data.get("visit_create_group_id")
+    place = data.get("visit_create_place")
+    raw_date = data.get("visit_date")
+    raw_time = data.get("visit_time")
+    if not group_id or not place or not raw_date or not raw_time:
+        await state.clear()
+        await message.answer("Начните снова.")
+        return
+    on_date = date.fromisoformat(str(raw_date))
+    at_time = _parse_visit_time(str(raw_time))
+    await state.update_data(visit_create_duration=str(minutes))
+    async with async_session_maker() as session:
+        group = await session.get(Group, str(group_id))
+        gname = group.name if group is not None else "?"
+        ends = (
+            datetime.combine(on_date, at_time) + timedelta(minutes=minutes)
+        ).time()
+        label = (
+            f"{_WEEKDAY_FULL_RU[on_date.weekday()]}, "
+            f"{format_school_date(on_date)}, "
+            f"{at_time.strftime('%H:%M')}–{ends.strftime('%H:%M')}, "
+            f"{gname}, {place}"
+        )
+    await message.answer(
+        f"Создать и отметить: {label}?",
+        reply_markup=_visit_create_confirm_keyboard(),
+    )
+
+
+@router.callback_query(F.data == "ppl_visit_create_yes")
+async def cb_ppl_visit_create_yes(query: CallbackQuery, state: FSMContext) -> None:
+    if query.from_user is None:
+        return
+    admin = await _require_admin_callback(query)
+    if admin is None:
+        return
+    data = await state.get_data()
+    person_id = data.get("visit_person_id")
+    group_id = data.get("visit_create_group_id")
+    place = data.get("visit_create_place")
+    raw_date = data.get("visit_date")
+    raw_time = data.get("visit_time")
+    raw_duration = data.get("visit_create_duration") or str(_DEFAULT_ADHOC_DURATION_MIN)
+    if not person_id or not group_id or not place or not raw_date or not raw_time:
+        await state.clear()
+        await query.answer()
+        if query.message:
+            await query.message.answer("Начните снова.")
+        return
+    on_date = date.fromisoformat(str(raw_date))
+    at_time = _parse_visit_time(str(raw_time))
+    minutes = int(str(raw_duration))
+    await query.answer()
+    if query.message is None:
+        return
+    async with async_session_maker() as session:
+        try:
+            school_session = await create_adhoc_session(
+                session,
+                group_id=str(group_id),
+                on_date=on_date,
+                start_time=at_time,
+                duration_minutes=minutes,
+                place=str(place),
+            )
+            await mark_attendance(
+                session,
+                str(person_id),
+                school_session.id,
+                "admin",
+                marked_by_id=admin.id,
+            )
+            await session.commit()
+            text = await _format_person_visits(session, str(person_id))
+            note = await _unlinked_suffix(session, str(person_id))
+        except ValueError:
+            await session.rollback()
+            await state.clear()
+            await query.message.answer("Не удалось создать занятие или отметить.")
+            return
+    await state.clear()
+    await query.message.answer(
+        f"Создано и отмечено.{note}\n\n{text}",
+        reply_markup=_visits_keyboard(str(person_id)),
+    )
+
+
+async def _on_index_pick_visit_create_grp(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    await _begin_visit_create(message, state, group_id=picked[0].id)
+
+
+async def _build_rows_visit_create_grp(
+    session: AsyncSession, data: dict[str, object]
+) -> list[PickRow]:
+    from .groups import _build_rows_active_groups
+
+    return await _build_rows_active_groups(session, data)
+
+
+register_pick_spec(
+    "visit_create_grp",
+    PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_visit_create_grp,
+        on_index_pick=_on_index_pick_visit_create_grp,
+    ),
+)
 
 
 @router.callback_query(F.data == "ppl_visit_move")

@@ -33,10 +33,11 @@ from app.services.attendance import mark_attendance, unmark_attendance
 from app.services.attendance_sheet import build_group_attendance_workbook
 from app.services.notices import (
     cancel_notice_text,
+    cancel_session,
     group_audience,
     notice_audience,
     reschedule_notice_text,
-    upcoming_sessions,
+    reschedule_session,
 )
 from app.services.notifications import answer_attendance
 from app.services.ocr import extract_roster_lines
@@ -65,6 +66,7 @@ from app.services.schedule import (
     deactivate_weekly_slot,
     ensure_occurrence,
     group_transfer_confirmation_text,
+    list_group_sessions,
     materialize_range,
     override_occurrence,
     parse_dmy,
@@ -102,6 +104,7 @@ from .common import (
 )
 from .states import (
     GroupRenameFSM,
+    GroupScheduleFSM,
     GroupStreamFSM,
     GuestPickFSM,
     NewGroupFSM,
@@ -475,9 +478,6 @@ async def _on_many_pick_att(
             person = await session.get(Person, row.id)
             if person is None:
                 continue
-            if person.telegram_user_id is None:
-                report_lines.append((number, row.full_name, "не в боте"))
-                continue
             att_result = await session.execute(
                 select(Attendance).where(
                     Attendance.person_id == person.id,
@@ -485,6 +485,7 @@ async def _on_many_pick_att(
                 )
             )
             existing = att_result.scalar_one_or_none()
+            unlinked = person.telegram_user_id is None
             if existing is not None:
                 await unmark_attendance(session, person.id, school_session_id)
                 outcome = "снят"
@@ -497,6 +498,8 @@ async def _on_many_pick_att(
                     marked_by_id=admin.id,
                 )
                 outcome = "отмечен"
+            if unlinked:
+                outcome = f"{outcome} (не в боте — оповещения не шлём)"
             report_lines.append((number, row.full_name, outcome))
         await session.commit()
     await message.answer(attendance_report(report_lines))
@@ -1527,9 +1530,132 @@ async def cb_grp_once(query: CallbackQuery, state: FSMContext) -> None:
         )
 
 
+def _schedule_period_keyboard(group_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Этот месяц",
+                    callback_data=f"grp_sched_m:{group_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Прошлый месяц",
+                    callback_data=f"grp_sched_p:{group_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Свои даты",
+                    callback_data=f"grp_sched_c:{group_id}",
+                ),
+            ],
+        ]
+    )
+
+
+def _group_session_actions_keyboard(session_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Перенести",
+                    callback_data=f"grp_sess_move:{session_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отменить занятие",
+                    callback_data=f"grp_sess_cancel:{session_id}",
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Отмена",
+                    callback_data="grp_sess_abort",
+                ),
+            ],
+        ]
+    )
+
+
+async def _send_group_schedule_list(
+    message: Message,
+    state: FSMContext,
+    group_id: str,
+    date_from: date,
+    date_to: date,
+) -> None:
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await message.answer("Не найдено")
+            await state.clear()
+            return
+        sessions = await list_group_sessions(session, group_id, date_from, date_to)
+        await session.commit()
+        gname = group.name
+        pick_rows = [
+            PickRow(
+                id=school_session.id,
+                full_name=_format_user_session_datetime(school_session.starts_at),
+                detail=school_session.place,
+            )
+            for school_session in sessions
+        ]
+    await state.clear()
+    if not pick_rows:
+        await message.answer(
+            f"«{gname}»: занятий с {format_school_date(date_from)} "
+            f"по {format_school_date(date_to)} нет."
+        )
+        return
+    await _start_list_pick(
+        message,
+        state,
+        purpose="gsess",
+        rows=pick_rows,
+        title=(
+            f"Расписание «{gname}» "
+            f"({format_school_date(date_from)}–{format_school_date(date_to)})."
+        ),
+        hint=HINT_INDEX,
+    )
+
+
+async def _on_index_pick_gsess(
+    message: Message, state: FSMContext, picked: list[PickRow]
+) -> None:
+    session_id = picked[0].id
+    async with async_session_maker() as session:
+        school_session = await session.get(SchoolSession, session_id)
+        if school_session is None:
+            await message.answer("Не найдено")
+            return
+        gname = await _session_group_name(session, school_session.group_id)
+        label = (
+            f"{gname}, {_format_user_session_datetime(school_session.starts_at)}, "
+            f"{school_session.place}"
+        )
+    await message.answer(
+        f"{label}\nПеренести или отменить?",
+        reply_markup=_group_session_actions_keyboard(session_id),
+    )
+
+
+register_pick_spec(
+    "gsess",
+    PickSpec(
+        is_index_pick=True,
+        build_rows=_build_rows_school_sessions,
+        on_index_pick=_on_index_pick_gsess,
+    ),
+)
+
+
 @router.callback_query(F.data.startswith("grp_sched:"))
-async def cb_grp_schedule(query: CallbackQuery) -> None:
-    """Read-only view of the group's upcoming sessions (no actions)."""
+async def cb_grp_schedule(query: CallbackQuery, state: FSMContext) -> None:
     if query.data is None:
         return
     group_id = query.data.split(":", 1)[1]
@@ -1540,27 +1666,246 @@ async def cb_grp_schedule(query: CallbackQuery) -> None:
         if group is None or group.archived_at is not None:
             await query.answer("Не найдено", show_alert=True)
             return
-        today = _today_local()
-        now = datetime.now(UTC)
-        await materialize_range(session, today, today + timedelta(days=21))
-        upcoming = await upcoming_sessions(session, now, group_id=group_id)
-        await session.commit()
-        gname = group.name
+    await state.clear()
     await query.answer()
-    if query.message is None:
-        return
-    if not upcoming:
+    if query.message:
         await query.message.answer(
-            f"«{gname}»: предстоящих занятий на ближайшие 21 день нет."
+            "Период расписания:",
+            reply_markup=_schedule_period_keyboard(group_id),
         )
+
+
+@router.callback_query(F.data.startswith("grp_sched_m:"))
+async def cb_grp_sched_this_month(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
         return
-    lines = [f"Расписание «{gname}» на ближайшие 21 день:"]
-    for school_session, _group_name in upcoming:
-        lines.append(
-            f"• {_format_user_session_datetime(school_session.starts_at)}, "
-            f"{school_session.place}"
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    date_from, date_to = _tabel_this_month_range()
+    await query.answer()
+    await _send_group_schedule_list(query.message, state, group_id, date_from, date_to)
+
+
+@router.callback_query(F.data.startswith("grp_sched_p:"))
+async def cb_grp_sched_prev_month(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    date_from, date_to = _tabel_prev_month_range()
+    await query.answer()
+    await _send_group_schedule_list(query.message, state, group_id, date_from, date_to)
+
+
+@router.callback_query(F.data.startswith("grp_sched_c:"))
+async def cb_grp_sched_custom(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
+        return
+    group_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        group = await session.get(Group, group_id)
+        if group is None or group.archived_at is not None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+    await state.set_state(GroupScheduleFSM.date_from)
+    await state.update_data(sched_group_id=group_id)
+    await query.answer()
+    await query.message.answer("Дата с (ДД.ММ.ГГГГ). Или «отмена».")
+
+
+@router.message(GroupScheduleFSM.date_from)
+async def fsm_sched_date_from(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        date_from = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Формат: ДД.ММ.ГГГГ")
+        return
+    await state.update_data(sched_date_from=date_from.isoformat())
+    await state.set_state(GroupScheduleFSM.date_to)
+    await message.answer("Дата по (ДД.ММ.ГГГГ). Или «отмена».")
+
+
+@router.message(GroupScheduleFSM.date_to)
+async def fsm_sched_date_to(message: Message, state: FSMContext) -> None:
+    if not message.text:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    try:
+        date_to = datetime.strptime(message.text.strip(), "%d.%m.%Y").date()
+    except ValueError:
+        await message.answer("Формат: ДД.ММ.ГГГГ")
+        return
+    data = await state.get_data()
+    group_id = data.get("sched_group_id")
+    raw_from = data.get("sched_date_from")
+    if not group_id or not raw_from:
+        await state.clear()
+        await message.answer("Сначала выберите группу.")
+        return
+    date_from = date.fromisoformat(str(raw_from))
+    if date_to < date_from:
+        await message.answer("Дата «по» раньше даты «с».")
+        return
+    await _send_group_schedule_list(
+        message, state, str(group_id), date_from, date_to
+    )
+
+
+@router.callback_query(F.data == "grp_sess_abort")
+async def cb_grp_sess_abort(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    await state.clear()
+    await query.answer()
+    if query.message:
+        await query.message.answer("Отменено.")
+
+
+@router.callback_query(F.data.startswith("grp_sess_move:"))
+async def cb_grp_sess_move(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None:
+        return
+    session_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    await state.set_state(GroupScheduleFSM.move_when)
+    await state.update_data(sched_session_id=session_id)
+    await query.answer()
+    await query.message.answer(
+        "Новые дата и время: ДД.ММ.ГГГГ ЧЧ:ММ. Или «отмена»."
+    )
+
+
+@router.message(GroupScheduleFSM.move_when)
+async def fsm_grp_sess_move_when(message: Message, state: FSMContext) -> None:
+    from .common import _parse_school_slot
+
+    if not message.text:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+    starts = _parse_school_slot(message.text)
+    if starts is None:
+        await message.answer("Нужен формат ДД.ММ.ГГГГ ЧЧ:ММ.")
+        return
+    await state.update_data(sched_new_starts=starts.isoformat())
+    await state.set_state(GroupScheduleFSM.move_place)
+    await message.answer(
+        "Место. Чтобы оставить прежнее — «то же». Или «отмена»."
+    )
+
+
+@router.message(GroupScheduleFSM.move_place)
+async def fsm_grp_sess_move_place(message: Message, state: FSMContext) -> None:
+    if not message.text or message.bot is None:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    data = await state.get_data()
+    session_id = data.get("sched_session_id")
+    raw_starts = data.get("sched_new_starts")
+    if not session_id or not raw_starts:
+        await state.clear()
+        await message.answer("Начните снова с «Расписание».")
+        return
+    new_starts = datetime.fromisoformat(str(raw_starts))
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            await state.clear()
+            return
+        school_session = await session.get(SchoolSession, str(session_id))
+        if school_session is None:
+            await message.answer("Не найдено")
+            await state.clear()
+            return
+        place = (
+            school_session.place
+            if message.text.strip().lower() == "то же"
+            else message.text.strip()
         )
-    await query.message.answer("\n".join(lines))
+        group_name = await _session_group_name(session, school_session.group_id)
+        was_future = school_session.starts_at >= datetime.now(UTC)
+        audience = await notice_audience(session, str(session_id)) if was_future else []
+        try:
+            updated, old_starts, old_place = await reschedule_session(
+                session, str(session_id), new_starts, place
+            )
+        except ValueError:
+            await message.answer("Это занятие уже нельзя перенести.")
+            await state.clear()
+            return
+        text = reschedule_notice_text(
+            group_name, old_starts, old_place, updated.starts_at, updated.place
+        )
+        await session.commit()
+    await state.clear()
+    if was_future and audience and message.bot is not None:
+        report, _, _ = await _send_notice(message.bot, audience, text)
+        await message.answer(f"{text}\n\n{report}")
+    else:
+        await message.answer(f"{text}\n\nУведомления не отправлялись.")
+
+
+@router.callback_query(F.data.startswith("grp_sess_cancel:"))
+async def cb_grp_sess_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None or query.message is None or query.bot is None:
+        return
+    session_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        school_session = await session.get(SchoolSession, session_id)
+        if school_session is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        group_name = await _session_group_name(session, school_session.group_id)
+        was_future = school_session.starts_at >= datetime.now(UTC)
+        audience = await notice_audience(session, session_id) if was_future else []
+        try:
+            cancelled = await cancel_session(session, session_id)
+        except ValueError:
+            await query.answer("Уже отменено", show_alert=True)
+            return
+        text = cancel_notice_text(
+            group_name, cancelled.starts_at, cancelled.place
+        )
+        await session.commit()
+    await state.clear()
+    await query.answer("Отменено")
+    if was_future and audience:
+        report, _, _ = await _send_notice(query.bot, audience, text)
+        await query.message.answer(f"{text}\n\n{report}")
+    else:
+        await query.message.answer(f"{text}\n\nУведомления не отправлялись.")
 
 
 def _tabel_period_keyboard(group_id: str) -> InlineKeyboardMarkup:

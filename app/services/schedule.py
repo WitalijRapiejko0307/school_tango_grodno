@@ -146,7 +146,10 @@ async def create_session(
 ) -> SchoolSession:
     if ends_at <= starts_at:
         raise ValueError("ends_at must be after starts_at")
+    if starts_at.tzinfo is None or ends_at.tzinfo is None:
+        raise ValueError("starts_at and ends_at must be timezone-aware")
 
+    local_date = starts_at.astimezone(_tz()).date()
     school_session = SchoolSession(
         group_id=group_id,
         starts_at=starts_at,
@@ -154,6 +157,7 @@ async def create_session(
         place=place,
         bring_notes=bring_notes,
         status="scheduled",
+        session_date=local_date,
     )
     session.add(school_session)
     await session.flush()
@@ -166,6 +170,93 @@ def parse_dmy(text: str) -> date:
 
 def _tz() -> ZoneInfo:
     return ZoneInfo(get_settings().SCHOOL_TZ)
+
+
+async def list_group_sessions(
+    session: AsyncSession,
+    group_id: str,
+    date_from: date,
+    date_to: date,
+) -> list[SchoolSession]:
+    """Scheduled sessions for a group in [date_from, date_to] inclusive (school TZ)."""
+    if date_to < date_from:
+        raise ValueError("date_to before date_from")
+    await materialize_range(session, date_from, date_to + timedelta(days=1))
+    tz = _tz()
+    start_utc = datetime(
+        date_from.year, date_from.month, date_from.day, tzinfo=tz
+    ).astimezone(timezone.utc)
+    end_utc = datetime(
+        date_to.year, date_to.month, date_to.day, tzinfo=tz
+    ).astimezone(timezone.utc) + timedelta(days=1)
+    result = await session.execute(
+        select(SchoolSession)
+        .where(
+            SchoolSession.group_id == group_id,
+            SchoolSession.status == "scheduled",
+            SchoolSession.starts_at >= start_utc,
+            SchoolSession.starts_at < end_utc,
+        )
+        .order_by(SchoolSession.starts_at)
+    )
+    return list(result.scalars().all())
+
+
+async def create_adhoc_session(
+    session: AsyncSession,
+    *,
+    group_id: str,
+    on_date: date,
+    start_time: time,
+    duration_minutes: int,
+    place: str,
+    bring_notes: str | None = None,
+) -> SchoolSession:
+    """Create a one-off session; reuse an existing match in the same group/time."""
+    if duration_minutes <= 0:
+        raise ValueError("duration_minutes")
+
+    await materialize_range(session, on_date, on_date + timedelta(days=1))
+    tz = _tz()
+    day_start = datetime(
+        on_date.year, on_date.month, on_date.day, tzinfo=tz
+    ).astimezone(timezone.utc)
+    day_end = day_start + timedelta(days=1)
+    result = await session.execute(
+        select(SchoolSession).where(
+            SchoolSession.group_id == group_id,
+            SchoolSession.status == "scheduled",
+            SchoolSession.starts_at >= day_start,
+            SchoolSession.starts_at < day_end,
+        )
+    )
+    for existing in result.scalars().all():
+        local = existing.starts_at
+        if local.tzinfo is None:
+            local = local.replace(tzinfo=timezone.utc)
+        local = local.astimezone(tz)
+        if local.hour == start_time.hour and local.minute == start_time.minute:
+            return existing
+
+    starts_local = datetime(
+        on_date.year,
+        on_date.month,
+        on_date.day,
+        start_time.hour,
+        start_time.minute,
+        tzinfo=tz,
+    )
+    ends_local = starts_local + timedelta(minutes=duration_minutes)
+    if ends_local.date() != on_date:
+        raise ValueError("session crosses midnight")
+    return await create_session(
+        session,
+        group_id,
+        starts_at=starts_local,
+        ends_at=ends_local,
+        place=place.strip(),
+        bring_notes=bring_notes,
+    )
 
 
 def _local_span(on_date: date, start: time, end: time) -> tuple[datetime, datetime]:

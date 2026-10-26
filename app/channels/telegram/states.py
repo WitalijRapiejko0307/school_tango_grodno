@@ -137,3 +137,12 @@ class PersonVisitFSM(StatesGroup):
     time = State()
     pick = State()
     edit_index = State()
+    create_place = State()
+    create_duration = State()
+
+
+class GroupScheduleFSM(StatesGroup):
+    date_from = State()
+    date_to = State()
+    move_when = State()
+    move_place = State()

@@ -98,7 +98,11 @@ async def mark_attendance(
         raise ValueError("source must be admin or client")
 
     person = await session.get(Person, person_id)
-    if person is None or person.telegram_user_id is None:
+    if person is None:
+        raise ValueError("person")
+    # Admin may record visits for name cards before Telegram claim.
+    # Client self-mark requires an activated (linked) person.
+    if source == "client" and person.telegram_user_id is None:
         raise ValueError("person is not activated")
 
     session_result = await session.execute(

@@ -10,6 +10,7 @@ from app.services.schedule import (
     _tz,
     archive_group,
     assign_group,
+    create_adhoc_session,
     create_group,
     create_session,
     create_stream,
@@ -17,6 +18,7 @@ from app.services.schedule import (
     deactivate_weekly_slot,
     ensure_occurrence,
     group_transfer_confirmation_text,
+    list_group_sessions,
     list_month_sessions,
     materialize_range,
     override_occurrence,
@@ -331,3 +333,33 @@ async def test_deactivate_weekly_slot_same_session_rules(
     assert to_cancel.status == "cancelled"
     assert kept.status == "scheduled"
     assert group.id == updated.group_id
+
+
+async def test_create_adhoc_past_session_visible_and_idempotent(
+    db_session: AsyncSession,
+) -> None:
+    group = await create_group(db_session, "Adhoc")
+    on_date = date(2026, 3, 10)
+    start = time(19, 0)
+    first = await create_adhoc_session(
+        db_session,
+        group_id=group.id,
+        on_date=on_date,
+        start_time=start,
+        duration_minutes=55,
+        place="Hall",
+    )
+    assert first.weekly_slot_id is None
+    assert first.session_date == on_date
+    assert first.status == "scheduled"
+    second = await create_adhoc_session(
+        db_session,
+        group_id=group.id,
+        on_date=on_date,
+        start_time=start,
+        duration_minutes=55,
+        place="Other",
+    )
+    assert second.id == first.id
+    rows = await list_group_sessions(db_session, group.id, on_date, on_date)
+    assert [row.id for row in rows] == [first.id]
