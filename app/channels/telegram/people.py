@@ -1168,6 +1168,9 @@ async def _resolve_visit_sessions(
     mode = str(data.get("visit_mode") or "add")
     async with async_session_maker() as session:
         matches = await find_sessions_at(session, on_date, at_time)
+        # Materialize may create SchoolSession rows — persist before confirm /
+        # mark in a later request, otherwise ids vanish on rollback.
+        await session.commit()
         if not matches:
             if mode == "add":
                 await message.answer(
@@ -1306,8 +1309,18 @@ async def _apply_visit_confirm(
             err = str(exc)
             if "not scheduled" in err:
                 await message.answer("Занятие отменено.")
+            elif "no active drop_in" in err or "no drop_in price" in err:
+                await message.answer(
+                    "Не удалось отметить: нет активного разового тарифа на эту дату."
+                )
             else:
                 await message.answer("Не удалось отметить посещение.")
+            await state.clear()
+            return
+        except Exception:
+            await session.rollback()
+            logger.exception("Visit confirm failed")
+            await message.answer("Не удалось отметить посещение.")
             await state.clear()
             return
     await state.clear()
@@ -1668,9 +1681,28 @@ async def cb_ppl_visit_create_yes(query: CallbackQuery, state: FSMContext) -> No
             await session.commit()
             text = await _format_person_visits(session, str(person_id))
             note = await _unlinked_suffix(session, str(person_id))
-        except ValueError:
+        except ValueError as exc:
             await session.rollback()
             await state.clear()
+            err = str(exc)
+            if "no active drop_in" in err or "no drop_in price" in err:
+                await query.message.answer(
+                    "Занятие могло создаться, но отметить не удалось: "
+                    "нет активного разового тарифа на эту дату."
+                )
+            elif "crosses midnight" in err:
+                await query.message.answer(
+                    "Длительность переходит через полночь — укажите меньше минут."
+                )
+            else:
+                await query.message.answer(
+                    "Не удалось создать занятие или отметить."
+                )
+            return
+        except Exception:
+            await session.rollback()
+            await state.clear()
+            logger.exception("Visit create+mark failed")
             await query.message.answer("Не удалось создать занятие или отметить.")
             return
     await state.clear()

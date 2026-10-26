@@ -546,3 +546,33 @@ async def test_find_sessions_at_mixed_active_and_archived_after_date(
     matches = await find_sessions_at(db_session, on_date, time(19, 0))
     places = {m.place for m in matches}
     assert places == {"Active hall", "Old hall"}
+
+
+async def test_find_sessions_at_materialize_survives_new_session(
+    db_session: AsyncSession,
+) -> None:
+    """Materialized occurrence must be committed before a later mark request."""
+    group = await create_group(db_session, "Main")
+    await create_weekly_slot(
+        db_session,
+        group.id,
+        weekday=date(2026, 10, 6).weekday(),
+        start_time=time(19, 0),
+        end_time=time(20, 30),
+        place="Hall",
+        notes=None,
+    )
+    await db_session.commit()
+
+    matches = await find_sessions_at(db_session, date(2026, 10, 6), time(19, 0))
+    assert len(matches) == 1
+    session_id = matches[0].id
+    await db_session.commit()
+
+    bind = db_session.bind
+    assert bind is not None
+    factory = async_sessionmaker(bind, class_=AsyncSession, expire_on_commit=False)
+    async with factory() as other:
+        row = await other.get(SchoolSession, session_id)
+        assert row is not None
+        assert row.status == "scheduled"
