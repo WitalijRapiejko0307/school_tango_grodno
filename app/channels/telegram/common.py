@@ -460,3 +460,12 @@ async def _list_pick_rows_from_data(
     if spec is None:
         return []
     return await spec.build_rows(session, data)
+
+
+def purge_button_row(kind: str, entity_id: str, name: str) -> list[InlineKeyboardButton]:
+    """Archive list row: restore button plus permanent delete."""
+    return [
+        InlineKeyboardButton(
+            text=f"Удалить: {name}"[:60], callback_data=f"purge_ask:{kind}:{entity_id}"
+        )
+    ]

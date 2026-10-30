@@ -32,6 +32,7 @@ from app.services.pick_list import HINT_INDEX, PickRow, page_text, short_report
 from app.services.schedule import parse_dmy
 
 from .common import (
+    purge_button_row,
     BTN_PRICE,
     PickSpec,
     _BlockArchivedMiddleware,
@@ -801,17 +802,18 @@ async def cb_prd_arch_list(query: CallbackQuery) -> None:
     if not products:
         await query.answer("Архив пуст", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for p in products:
+        kb_rows.append(
             [
                 InlineKeyboardButton(
                     text=f"Вернуть: {p.name}",
                     callback_data=f"prd_back:{p.id}",
                 )
             ]
-            for p in products
-        ]
-    )
+        )
+        kb_rows.append(purge_button_row("product", p.id, p.name))
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await query.answer()
     if query.message:
         await query.message.answer("Архив продуктов:", reply_markup=kb)

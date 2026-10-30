@@ -127,17 +127,17 @@ async def lifespan(app: FastAPI):
                     "marked_by_id VARCHAR(36)"
                 )
             )
+            # Archived entities can be deleted for good; dependents keep the id
+            # and a snapshot in deleted_entities, so these FKs must not exist.
             await conn.execute(
                 text(
-                    "DO $$ BEGIN "
-                    "IF NOT EXISTS ("
-                    "SELECT 1 FROM pg_constraint "
-                    "WHERE conname = 'fk_attendances_marked_by_id_persons'"
-                    ") THEN "
-                    "ALTER TABLE attendances ADD CONSTRAINT "
-                    "fk_attendances_marked_by_id_persons "
-                    "FOREIGN KEY (marked_by_id) REFERENCES persons(id); "
-                    "END IF; END $$"
+                    "DO $$ DECLARE r record; BEGIN "
+                    "FOR r IN SELECT c.conname, c.conrelid::regclass AS tbl "
+                    "FROM pg_constraint c WHERE c.contype = 'f' AND "
+                    "c.confrelid::regclass::text IN "
+                    "('persons','groups','weekly_slots','products','prices') "
+                    "LOOP EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', "
+                    "r.tbl, r.conname); END LOOP; END $$"
                 )
             )
             await conn.execute(
@@ -157,19 +157,6 @@ async def lifespan(app: FastAPI):
                 text(
                     "ALTER TABLE subscriptions ADD COLUMN IF NOT EXISTS "
                     "partner_id VARCHAR(36)"
-                )
-            )
-            await conn.execute(
-                text(
-                    "DO $$ BEGIN "
-                    "IF NOT EXISTS ("
-                    "SELECT 1 FROM pg_constraint "
-                    "WHERE conname = 'fk_subscriptions_partner_id_persons'"
-                    ") THEN "
-                    "ALTER TABLE subscriptions ADD CONSTRAINT "
-                    "fk_subscriptions_partner_id_persons "
-                    "FOREIGN KEY (partner_id) REFERENCES persons(id); "
-                    "END IF; END $$"
                 )
             )
             await conn.execute(

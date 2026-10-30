@@ -79,6 +79,7 @@ from app.services.schedule import (
 from app.services.school_time import format_school_date, format_school_datetime, school_tz
 
 from .common import (
+    purge_button_row,
     BTN_GROUPS,
     BTN_MY_GROUP,
     BTN_SCHEDULE,
@@ -1951,9 +1952,13 @@ async def _send_group_tabel(
     group_id: str,
     date_from: date,
     date_to: date,
+    *,
+    admin_checked: bool = False,
 ) -> None:
     async with async_session_maker() as session:
-        if await _require_admin_message_strict(message, session) is None:
+        if not admin_checked and (
+            await _require_admin_message_strict(message, session) is None
+        ):
             await state.clear()
             return
         group = await session.get(Group, group_id)
@@ -2008,7 +2013,9 @@ async def cb_grp_tabel_this_month(query: CallbackQuery, state: FSMContext) -> No
         return
     date_from, date_to = _tabel_this_month_range()
     await query.answer()
-    await _send_group_tabel(query.message, state, group_id, date_from, date_to)
+    await _send_group_tabel(
+        query.message, state, group_id, date_from, date_to, admin_checked=True
+    )
 
 
 @router.callback_query(F.data.startswith("grp_tabel_p:"))
@@ -2020,7 +2027,9 @@ async def cb_grp_tabel_prev_month(query: CallbackQuery, state: FSMContext) -> No
         return
     date_from, date_to = _tabel_prev_month_range()
     await query.answer()
-    await _send_group_tabel(query.message, state, group_id, date_from, date_to)
+    await _send_group_tabel(
+        query.message, state, group_id, date_from, date_to, admin_checked=True
+    )
 
 
 @router.callback_query(F.data.startswith("grp_tabel_c:"))
@@ -2219,17 +2228,18 @@ async def cb_grp_arch_list(query: CallbackQuery) -> None:
     if not groups:
         await query.answer("Архив пуст", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for g in groups:
+        kb_rows.append(
             [
                 InlineKeyboardButton(
                     text=f"Вернуть: {g.name}",
                     callback_data=f"grp_back:{g.id}",
                 )
             ]
-            for g in groups
-        ]
-    )
+        )
+        kb_rows.append(purge_button_row("group", g.id, g.name))
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await query.answer()
     if query.message:
         await query.message.answer("Архив групп:", reply_markup=kb)
@@ -2362,17 +2372,18 @@ async def cb_slot_arch_list(query: CallbackQuery) -> None:
     if not slots:
         await query.answer("Архив слотов пуст", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for s in slots:
+        kb_rows.append(
             [
                 InlineKeyboardButton(
                     text=f"Вернуть: {_weekly_slot_label(s)[:55]}",
                     callback_data=f"slot_back:{s.id}",
                 )
             ]
-            for s in slots
-        ]
-    )
+        )
+        kb_rows.append(purge_button_row("slot", s.id, _weekly_slot_label(s)))
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await query.answer()
     if query.message:
         await query.message.answer(

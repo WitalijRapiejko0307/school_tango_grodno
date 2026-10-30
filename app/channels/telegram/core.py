@@ -784,25 +784,8 @@ async def cb_other_group_back(query: CallbackQuery) -> None:
 
 
 
-@router.callback_query(
-    F.data.in_(
-        (
-            "att_more",
-            "msg_more",
-            "grp_more",
-            "prd_more",
-            "today_more",
-            "sess_more",
-            "slot_week_more",
-            "slot_once_more",
-            "grp_slot_more",
-            "grp_roster_more",
-            "grp_stream_more",
-            "grp_assign_more",
-            "ppl_add_more",
-        )
-    )
-)
+# pp_more (people list) has its own handler in people.py.
+@router.callback_query(F.data.endswith("_more") & (F.data != "pp_more"))
 async def cb_list_pick_more(query: CallbackQuery, state: FSMContext) -> None:
     if await _require_admin_callback(query) is None:
         return

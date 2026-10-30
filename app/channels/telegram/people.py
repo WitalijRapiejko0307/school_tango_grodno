@@ -36,7 +36,9 @@ from app.services.attendance import (
     unmark_attendance,
 )
 from app.services.billing import (
-    list_payable_subscriptions,
+    delete_subscription,
+    subscription_payments_count,
+    update_subscription,
     person_has_unpaid_started,
     record_payment,
     replace_partner,
@@ -57,6 +59,13 @@ from app.services.school_time import (
 )
 from app.services.user_labels import format_person_list_detail, format_person_role_label
 from app.services.identity import demote_admin, invite_admin
+from app.services.purge import (
+    deleted_label,
+    PURGE_KINDS,
+    NotArchivedError,
+    purge_entity,
+    purge_preview,
+)
 from app.services.pick_list import (
     HINT_INDEX,
     HINT_ONE,
@@ -81,6 +90,7 @@ from app.services.schedule import (
 )
 
 from .common import (
+    purge_button_row,
     BTN_CONTACTS,
     BTN_PEOPLE,
     PickSpec,
@@ -99,6 +109,8 @@ from .states import (
     ContactFSM,
     PayInFSM,
     PeopleAddFSM,
+    SubDueFSM,
+    SubEditFSM,
     PeoplePickFSM,
     PersonVisitFSM,
 )
@@ -909,17 +921,18 @@ async def cb_ppl_arch(query: CallbackQuery) -> None:
     if not archived:
         await query.answer("Архив пуст", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for p in archived:
+        kb_rows.append(
             [
                 InlineKeyboardButton(
                     text=f"Вернуть: {p.full_name}",
                     callback_data=f"ppl_back:{p.id}",
                 )
             ]
-            for p in archived
-        ]
-    )
+        )
+        kb_rows.append(purge_button_row("person", p.id, p.full_name))
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await query.answer()
     if query.message:
         await query.message.answer("Архив клиентов:", reply_markup=kb)
@@ -1051,34 +1064,36 @@ async def _format_person_subscriptions(
     if not subs:
         return "Абонементов нет.", None
     lines: list[str] = ["Абонементы:"]
-    buttons: list[list[InlineKeyboardButton]] = []
-    for sub in subs:
+    buttons: list[InlineKeyboardButton] = []
+    for number, sub in enumerate(subs, start=1):
         product = await session.get(Product, sub.product_id)
-        product_name = product.name if product is not None else "?"
+        product_name = (
+            product.name
+            if product is not None
+            else await deleted_label(session, "product", sub.product_id)
+        )
         partner_line = ""
         if sub.partner_id:
             partner = await session.get(Person, sub.partner_id)
-            if partner is not None:
-                partner_line = f"\nПартнёр: {partner.full_name}"
+            partner_name = (
+                partner.full_name
+                if partner is not None
+                else await deleted_label(session, "person", sub.partner_id)
+            )
+            partner_line = f"\nПартнёр: {partner_name}"
         period = _subscription_period_label(sub)
         status = subscription_payment_status(sub)
         unpaid = " — не оплачен" if status == "unpaid" else ""
         lines.append(
-            f"\n{product_name}{partner_line}\n"
+            f"\n{number}. {product_name}{partner_line}\n"
             f"{period}\n"
             f"Осталось занятий: {sub.lessons_left}{unpaid}"
         )
-        if product is not None and product.audience == "couple":
-            buttons.append(
-                [
-                    InlineKeyboardButton(
-                        text="Изменить пару",
-                        callback_data=f"ppl_pair:{sub.id}",
-                    )
-                ]
-            )
-    kb = InlineKeyboardMarkup(inline_keyboard=buttons) if buttons else None
-    return "\n".join(lines), kb
+        buttons.append(
+            InlineKeyboardButton(text=str(number), callback_data=f"ppl_sub:{sub.id}")
+        )
+    rows = [buttons[i : i + 5] for i in range(0, len(buttons), 5)]
+    return "\n".join(lines), InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 async def _person_visit_rows(
@@ -1087,14 +1102,19 @@ async def _person_visit_rows(
     result = await session.execute(
         select(Attendance, SchoolSession, Group)
         .join(SchoolSession, Attendance.session_id == SchoolSession.id)
-        .join(Group, SchoolSession.group_id == Group.id)
+        .outerjoin(Group, SchoolSession.group_id == Group.id)
         .where(Attendance.person_id == person_id)
         .order_by(desc(SchoolSession.starts_at))
     )
-    return [
-        (att, school_session, group.name)
-        for att, school_session, group in result.all()
-    ]
+    out: list[tuple[Attendance, SchoolSession, str]] = []
+    for att, school_session, group in result.all():
+        name = (
+            group.name
+            if group is not None
+            else await deleted_label(session, "group", school_session.group_id)
+        )
+        out.append((att, school_session, name))
+    return out
 
 
 async def _format_person_visits(session: AsyncSession, person_id: str) -> str:
@@ -1335,22 +1355,13 @@ def _parse_payment_amount(text: str) -> Decimal:
     return Decimal(text.strip().replace(",", "."))
 
 
-def _payments_keyboard(person_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="Внести оплату",
-                    callback_data=f"ppl_payin:{person_id}",
-                )
-            ]
-        ]
-    )
-
-
 async def _payin_amount_prompt(session: AsyncSession, sub: Subscription) -> str:
     product = await session.get(Product, sub.product_id)
-    name = product.name if product is not None else "?"
+    name = (
+        product.name
+        if product is not None
+        else await deleted_label(session, "product", sub.product_id)
+    )
     remainder = sub.amount_due - sub.amount_paid
     return (
         f"{name}\n"
@@ -1364,7 +1375,7 @@ async def _format_person_payments(session: AsyncSession, person_id: str) -> str:
     result = await session.execute(
         select(Payment, Subscription, Product)
         .join(Subscription, Payment.subscription_id == Subscription.id)
-        .join(Product, Subscription.product_id == Product.id)
+        .outerjoin(Product, Subscription.product_id == Product.id)
         .where(
             or_(
                 Subscription.person_id == person_id,
@@ -1377,10 +1388,15 @@ async def _format_person_payments(session: AsyncSession, person_id: str) -> str:
     if not rows:
         return "Оплат нет."
     lines = ["Оплаты:"]
-    for payment, _sub, product in rows:
+    for payment, sub, product in rows:
+        product_name = (
+            product.name
+            if product is not None
+            else await deleted_label(session, "product", sub.product_id)
+        )
         lines.append(
             f"• {format_school_date(payment.paid_on)} — "
-            f"{payment.amount} — {product.name}"
+            f"{payment.amount} — {product_name}"
         )
     return "\n".join(lines)
 
@@ -1866,78 +1882,7 @@ async def cb_ppl_pays(query: CallbackQuery) -> None:
         text = await _format_person_payments(session, person_id)
     await query.answer()
     if query.message:
-        await query.message.answer(text, reply_markup=_payments_keyboard(person_id))
-
-
-@router.callback_query(F.data.startswith("ppl_payin:"))
-async def cb_ppl_payin(query: CallbackQuery, state: FSMContext) -> None:
-    if query.data is None:
-        return
-    person_id = query.data.split(":", 1)[1]
-    if await _require_admin_callback(query) is None:
-        return
-    today = datetime.now(school_tz()).date()
-    async with async_session_maker() as session:
-        subs = await list_payable_subscriptions(session, person_id, today)
-    if not subs:
-        await query.answer(
-            "Нет активного неоплаченного абонемента.", show_alert=True
-        )
-        return
-    await query.answer()
-    if query.message is None:
-        return
-    if len(subs) == 1:
-        sub = subs[0]
-        async with async_session_maker() as session:
-            prompt = await _payin_amount_prompt(session, sub)
-        await state.set_state(PayInFSM.amount)
-        await state.update_data(person_id=person_id, subscription_id=sub.id)
-        await query.message.answer(prompt)
-        return
-    async with async_session_maker() as session:
-        rows: list[list[InlineKeyboardButton]] = []
-        for sub in subs:
-            product = await session.get(Product, sub.product_id)
-            name = product.name if product is not None else "?"
-            rows.append(
-                [
-                    InlineKeyboardButton(
-                        text=name,
-                        callback_data=f"ppl_paypick:{sub.id}",
-                    )
-                ]
-            )
-    await state.update_data(person_id=person_id)
-    await query.message.answer(
-        "Выберите абонемент:",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
-    )
-
-
-@router.callback_query(F.data.startswith("ppl_paypick:"))
-async def cb_ppl_paypick(query: CallbackQuery, state: FSMContext) -> None:
-    if query.data is None:
-        return
-    subscription_id = query.data.split(":", 1)[1]
-    if await _require_admin_callback(query) is None:
-        return
-    data = await state.get_data()
-    person_id = data.get("person_id")
-    if not person_id:
-        await query.answer("Ошибка", show_alert=True)
-        return
-    async with async_session_maker() as session:
-        sub = await session.get(Subscription, subscription_id)
-        if sub is None:
-            await query.answer("Не найдено", show_alert=True)
-            return
-        prompt = await _payin_amount_prompt(session, sub)
-    await query.answer()
-    await state.set_state(PayInFSM.amount)
-    await state.update_data(person_id=person_id, subscription_id=subscription_id)
-    if query.message:
-        await query.message.answer(prompt)
+        await query.message.answer(text, reply_markup=None)
 
 
 @router.message(PayInFSM.amount, F.text)
@@ -1968,6 +1913,17 @@ async def fsm_payin_amount(message: Message, state: FSMContext) -> None:
         admin = await _require_admin_message_strict(message, session)
         if admin is None:
             return
+        sub = await session.get(Subscription, str(subscription_id))
+        if sub is None:
+            await state.clear()
+            await message.answer("Абонемент не найден.")
+            return
+        if sub.amount_due is not None and amount > sub.amount_due - sub.amount_paid:
+            await message.answer(
+                f"Сумма больше остатка ({sub.amount_due - sub.amount_paid}). "
+                "Введите меньше или «отмена»."
+            )
+            return
         await record_payment(
             session,
             str(subscription_id),
@@ -1978,7 +1934,7 @@ async def fsm_payin_amount(message: Message, state: FSMContext) -> None:
         await session.commit()
         text = await _format_person_payments(session, str(person_id))
     await state.clear()
-    await message.answer(text, reply_markup=_payments_keyboard(str(person_id)))
+    await message.answer(text)
 
 
 @router.callback_query(F.data.startswith("ppl_pair:"))
@@ -2015,6 +1971,464 @@ async def cb_ppl_pair(query: CallbackQuery, state: FSMContext) -> None:
             title="Номер выберет нового партнёра пары.",
         )
         await state.update_data(pair_subscription_id=subscription_id)
+
+
+@router.callback_query(F.data.startswith("purge_ask:"))
+async def cb_purge_ask(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    _, kind, entity_id = query.data.split(":", 2)
+    if await _require_admin_callback(query) is None:
+        return
+    if kind not in PURGE_KINDS:
+        await query.answer("Не найдено", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        try:
+            text = await purge_preview(session, kind, entity_id)
+        except NotArchivedError:
+            await query.answer("Не найдено", show_alert=True)
+            return
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            text, reply_markup=_ok_cancel_keyboard(f"purge_ok:{kind}:{entity_id}")
+        )
+
+
+@router.callback_query(F.data.startswith("purge_ok:"))
+async def cb_purge_ok(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    _, kind, entity_id = query.data.split(":", 2)
+    if await _require_admin_callback(query) is None:
+        return
+    if kind not in PURGE_KINDS:
+        await query.answer("Не найдено", show_alert=True)
+        return
+    async with async_session_maker() as session:
+        try:
+            label = await purge_entity(session, kind, entity_id)
+        except NotArchivedError:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        await session.commit()
+    await query.answer("Удалено")
+    if query.message:
+        await query.message.answer(f"Удалено навсегда: {label}")
+
+
+def _sub_menu_keyboard(sub: Subscription, couple: bool) -> InlineKeyboardMarkup:
+    rows = [
+        [
+            InlineKeyboardButton(text="Удалить", callback_data=f"ppl_sub_del:{sub.id}"),
+            InlineKeyboardButton(text="Изменить", callback_data=f"ppl_sub_edit:{sub.id}"),
+        ]
+    ]
+    if couple:
+        rows.append(
+            [InlineKeyboardButton(text="Изменить пару", callback_data=f"ppl_pair:{sub.id}")]
+        )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="Внести оплату", callback_data=f"ppl_sub_pay:{sub.id}"
+            ),
+            InlineKeyboardButton(
+                text="История оплат", callback_data=f"ppl_sub_pays:{sub.id}"
+            ),
+        ]
+    )
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _ok_cancel_keyboard(ok_data: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(text="Ок", callback_data=ok_data),
+                InlineKeyboardButton(text="Отмена", callback_data="ppl_sub_cancel"),
+            ]
+        ]
+    )
+
+
+async def _sub_summary(session: AsyncSession, sub: Subscription) -> str:
+    product = await session.get(Product, sub.product_id)
+    name = (
+        product.name
+        if product is not None
+        else await deleted_label(session, "product", sub.product_id)
+    )
+    due = "не задана" if sub.amount_due is None else str(sub.amount_due)
+    return (
+        f"{name}\n{_subscription_period_label(sub)}\n"
+        f"Осталось занятий: {sub.lessons_left}\n"
+        f"К оплате: {due}, оплачено: {sub.amount_paid}"
+    )
+
+
+@router.callback_query(F.data.startswith("ppl_sub:"))
+async def cb_ppl_sub(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        sub = await session.get(Subscription, sub_id)
+        if sub is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        product = await session.get(Product, sub.product_id)
+        text = await _sub_summary(session, sub)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            text,
+            reply_markup=_sub_menu_keyboard(
+                sub, product is not None and product.audience == "couple"
+            ),
+        )
+
+
+@router.callback_query(F.data == "ppl_sub_cancel")
+async def cb_ppl_sub_cancel(query: CallbackQuery, state: FSMContext) -> None:
+    if await _require_admin_callback(query) is None:
+        return
+    await state.clear()
+    await query.answer("Отменено")
+
+
+@router.callback_query(F.data.startswith("ppl_sub_del:"))
+async def cb_ppl_sub_del(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        sub = await session.get(Subscription, sub_id)
+        if sub is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        if sub.amount_paid > 0 or await subscription_payments_count(session, sub_id):
+            await query.answer(
+                "Есть оплаты — удалять нельзя.", show_alert=True
+            )
+            return
+        text = await _sub_summary(session, sub)
+    await query.answer()
+    if query.message:
+        await query.message.answer(
+            f"Удалить абонемент?\n{text}",
+            reply_markup=_ok_cancel_keyboard(f"ppl_sub_del_ok:{sub_id}"),
+        )
+
+
+@router.callback_query(F.data.startswith("ppl_sub_del_ok:"))
+async def cb_ppl_sub_del_ok(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        try:
+            await delete_subscription(session, sub_id)
+        except ValueError:
+            await query.answer("Удалить нельзя", show_alert=True)
+            return
+        await session.commit()
+    await query.answer("Удалено")
+    if query.message:
+        await query.message.answer("Абонемент удалён.")
+
+
+_SUB_KEEP = "-"
+
+
+def _parse_optional_date(text: str) -> date | None:
+    return datetime.strptime(text.strip(), "%d.%m.%Y").date()
+
+
+@router.callback_query(F.data.startswith("ppl_sub_edit:"))
+async def cb_ppl_sub_edit(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        sub = await session.get(Subscription, sub_id)
+        if sub is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+    await query.answer()
+    await state.set_state(SubEditFSM.starts_on)
+    await state.update_data(sub_id=sub_id)
+    if query.message:
+        await query.message.answer(
+            "Дата начала (ДД.ММ.ГГГГ), «-» — не менять, «нет» — с первого визита, "
+            "«отмена» — выйти:"
+        )
+
+
+async def _sub_edit_step(
+    message: Message, state: FSMContext, key: str, prompt: str, nxt, parse
+) -> None:
+    if message.text is None:
+        return
+    text = message.text.strip()
+    if text.casefold() == "отмена":
+        await state.clear()
+        await message.answer("Правка отменена.")
+        return
+    data = await state.get_data()
+    if text == _SUB_KEEP:
+        value = data.get(f"orig_{key}", "__keep__")
+        if value == "__keep__":
+            async with async_session_maker() as session:
+                sub = await session.get(Subscription, str(data["sub_id"]))
+            value = _sub_field_json(sub, key) if sub else None
+    else:
+        try:
+            value = parse(text)
+        except (ValueError, InvalidOperation):
+            await message.answer("Неверный формат. Попробуйте ещё раз.")
+            return
+    await state.update_data(**{f"new_{key}": value})
+    await state.set_state(nxt)
+    if prompt:
+        await message.answer(prompt)
+
+
+def _sub_field_json(sub: Subscription, key: str):
+    value = getattr(sub, key)
+    if isinstance(value, date):
+        return value.isoformat()
+    if isinstance(value, Decimal):
+        return str(value)
+    return value
+
+
+def _parse_date_json(text: str):
+    if text.casefold() == "нет":
+        return None
+    return _parse_optional_date(text).isoformat()
+
+
+def _parse_amount_json(text: str):
+    if text.casefold() == "нет":
+        return None
+    value = Decimal(text.replace(",", "."))
+    if value < 0:
+        raise ValueError
+    return str(value)
+
+
+def _parse_lessons(text: str):
+    value = int(text)
+    if value < 0:
+        raise ValueError
+    return value
+
+
+_DATE_PROMPT_UNTIL = "Срок действия до (ДД.ММ.ГГГГ), «-» — не менять, «нет» — без срока:"
+
+
+@router.message(SubEditFSM.starts_on, F.text)
+async def fsm_sub_edit_starts_on(message: Message, state: FSMContext) -> None:
+    await _sub_edit_step(
+        message, state, "starts_on", _DATE_PROMPT_UNTIL,
+        SubEditFSM.valid_until, _parse_date_json,
+    )
+
+
+@router.message(SubEditFSM.valid_until, F.text)
+async def fsm_sub_edit_valid_until(message: Message, state: FSMContext) -> None:
+    await _sub_edit_step(
+        message, state, "valid_until",
+        "Остаток занятий (число) или «-»:",
+        SubEditFSM.lessons_left, _parse_date_json,
+    )
+
+
+@router.message(SubEditFSM.lessons_left, F.text)
+async def fsm_sub_edit_lessons(message: Message, state: FSMContext) -> None:
+    await _sub_edit_step(
+        message, state, "lessons_left",
+        "Сумма к оплате (число), «-» — не менять, «нет» — не задана:",
+        SubEditFSM.amount_due, _parse_lessons,
+    )
+
+
+@router.message(SubEditFSM.amount_due, F.text)
+async def fsm_sub_edit_amount_due(message: Message, state: FSMContext) -> None:
+    await _sub_edit_step(
+        message, state, "amount_due", "", SubEditFSM.confirm, _parse_amount_json
+    )
+    if await state.get_state() != SubEditFSM.confirm.state:
+        return
+    data = await state.get_data()
+    sub_id = str(data["sub_id"])
+    lines = [
+        "Сохранить изменения?",
+        f"Начало: {_fmt_json_date(data.get('new_starts_on'))}",
+        f"До: {_fmt_json_date(data.get('new_valid_until'))}",
+        f"Осталось занятий: {data.get('new_lessons_left')}",
+        f"К оплате: {data.get('new_amount_due') or 'не задана'}",
+    ]
+    await message.answer(
+        "\n".join(lines), reply_markup=_ok_cancel_keyboard(f"ppl_sub_edit_ok:{sub_id}")
+    )
+
+
+def _fmt_json_date(value) -> str:
+    if not value:
+        return "—"
+    return format_school_date(date.fromisoformat(str(value)))
+
+
+@router.callback_query(F.data.startswith("ppl_sub_edit_ok:"), SubEditFSM.confirm)
+async def cb_ppl_sub_edit_ok(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    data = await state.get_data()
+    if str(data.get("sub_id")) != sub_id:
+        await query.answer("Устарело", show_alert=True)
+        return
+    starts = data.get("new_starts_on")
+    until = data.get("new_valid_until")
+    due = data.get("new_amount_due")
+    async with async_session_maker() as session:
+        try:
+            await update_subscription(
+                session,
+                sub_id,
+                starts_on=date.fromisoformat(starts) if starts else None,
+                valid_until=date.fromisoformat(until) if until else None,
+                lessons_left=int(data["new_lessons_left"]),
+                amount_due=Decimal(due) if due is not None else None,
+            )
+        except ValueError as exc:
+            await query.answer(
+                "Сумма к оплате меньше уже внесённой."
+                if "already paid" in str(exc)
+                else "Проверьте даты и остаток.",
+                show_alert=True,
+            )
+            return
+        await session.commit()
+        sub = await session.get(Subscription, sub_id)
+        text = await _sub_summary(session, sub)
+    await state.clear()
+    await query.answer("Сохранено")
+    if query.message:
+        await query.message.answer(f"Сохранено.\n{text}")
+
+
+@router.callback_query(F.data.startswith("ppl_sub_pays:"))
+async def cb_ppl_sub_pays(query: CallbackQuery) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        result = await session.execute(
+            select(Payment)
+            .where(Payment.subscription_id == sub_id)
+            .order_by(desc(Payment.paid_on), desc(Payment.created_at))
+        )
+        payments = list(result.scalars().all())
+    await query.answer()
+    if query.message:
+        if not payments:
+            await query.message.answer("Оплат по абонементу нет.")
+            return
+        lines = ["Оплаты абонемента:"] + [
+            f"• {format_school_date(p.paid_on)} — {p.amount}" for p in payments
+        ]
+        await query.message.answer("\n".join(lines))
+
+
+@router.callback_query(F.data.startswith("ppl_sub_pay:"))
+async def cb_ppl_sub_pay(query: CallbackQuery, state: FSMContext) -> None:
+    if query.data is None:
+        return
+    sub_id = query.data.split(":", 1)[1]
+    if await _require_admin_callback(query) is None:
+        return
+    async with async_session_maker() as session:
+        sub = await session.get(Subscription, sub_id)
+        if sub is None:
+            await query.answer("Не найдено", show_alert=True)
+            return
+        person_id = sub.person_id
+        due = sub.amount_due
+        paid = sub.amount_paid
+        prompt = await _payin_amount_prompt(session, sub) if due is not None else ""
+    await query.answer()
+    if query.message is None:
+        return
+    if due is None:
+        await state.set_state(SubDueFSM.amount_due)
+        await state.update_data(sub_id=sub_id, person_id=person_id)
+        await query.message.answer("Сумма к оплате по абонементу (число):")
+        return
+    if paid >= due:
+        await query.message.answer("Абонемент уже оплачен полностью.")
+        return
+    await state.set_state(PayInFSM.amount)
+    await state.update_data(person_id=person_id, subscription_id=sub_id)
+    await query.message.answer(prompt)
+
+
+@router.message(SubDueFSM.amount_due, F.text)
+async def fsm_sub_due_amount(message: Message, state: FSMContext) -> None:
+    if message.text is None:
+        return
+    if message.text.strip().casefold() == "отмена":
+        await state.clear()
+        await message.answer("Отменено.")
+        return
+    try:
+        due = _parse_payment_amount(message.text)
+    except InvalidOperation:
+        await message.answer("Введите число.")
+        return
+    if due <= 0:
+        await message.answer("Сумма должна быть больше нуля.")
+        return
+    data = await state.get_data()
+    async with async_session_maker() as session:
+        if await _require_admin_message_strict(message, session) is None:
+            return
+        sub = await session.get(Subscription, str(data["sub_id"]))
+        if sub is None:
+            await state.clear()
+            await message.answer("Абонемент не найден.")
+            return
+        if due < sub.amount_paid:
+            await message.answer("Сумма меньше уже внесённой.")
+            return
+        sub.amount_due = due
+        await session.commit()
+        prompt = await _payin_amount_prompt(session, sub)
+        paid_in_full = sub.amount_paid >= due
+    if paid_in_full:
+        await state.clear()
+        await message.answer("Сумма задана. Абонемент уже оплачен полностью.")
+        return
+    await state.set_state(PayInFSM.amount)
+    await state.update_data(
+        person_id=data["person_id"], subscription_id=data["sub_id"]
+    )
+    await message.answer(prompt)
 
 
 @router.callback_query(F.data.startswith("ppl_contact:"))
@@ -2261,17 +2675,18 @@ async def cb_ctc_arch_list(query: CallbackQuery) -> None:
     if not cards:
         await query.answer("Архив пуст", show_alert=True)
         return
-    kb = InlineKeyboardMarkup(
-        inline_keyboard=[
+    kb_rows: list[list[InlineKeyboardButton]] = []
+    for card in cards:
+        kb_rows.append(
             [
                 InlineKeyboardButton(
                     text=f"Вернуть: {card.name}",
                     callback_data=f"ctc_rst:{card.id}",
                 )
             ]
-            for card in cards
-        ]
-    )
+        )
+        kb_rows.append(purge_button_row("contact", card.id, card.name))
+    kb = InlineKeyboardMarkup(inline_keyboard=kb_rows)
     await query.answer()
     if query.message:
         await query.message.answer("Архив контактов:", reply_markup=kb)

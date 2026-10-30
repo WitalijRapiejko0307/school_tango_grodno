@@ -104,6 +104,18 @@ class PayInFSM(StatesGroup):
     amount = State()
 
 
+class SubEditFSM(StatesGroup):
+    starts_on = State()
+    valid_until = State()
+    lessons_left = State()
+    amount_due = State()
+    confirm = State()
+
+
+class SubDueFSM(StatesGroup):
+    amount_due = State()
+
+
 class PeopleAddFSM(StatesGroup):
     name = State()
 

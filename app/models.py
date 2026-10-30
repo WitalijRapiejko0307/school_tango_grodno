@@ -50,6 +50,27 @@ class Person(Base):
     )
 
 
+class DeletedEntity(Base):
+    """Snapshot of a permanently deleted archived entity.
+
+    Rows that referenced the entity keep its id (no foreign key); the label here
+    is what reports and lists show instead.
+    """
+
+    __tablename__ = "deleted_entities"
+    __table_args__ = (
+        UniqueConstraint("entity_type", "entity_id", name="uq_deleted_entities_ref"),
+    )
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
+    entity_type: Mapped[str] = mapped_column(String(16), nullable=False)
+    entity_id: Mapped[str] = mapped_column(String(36), nullable=False)
+    label: Mapped[str] = mapped_column(String(255), nullable=False)
+    deleted_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+
 class AdminInvite(Base):
     __tablename__ = "admin_invites"
     __table_args__ = (
@@ -63,11 +84,11 @@ class AdminInvite(Base):
     username: Mapped[str | None] = mapped_column(String(255), nullable=True)
     phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
     invited_by_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="pending")
     person_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=True
+        String(36), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -95,7 +116,7 @@ class StreamMember(Base):
         String(36), ForeignKey("streams.id"), nullable=False
     )
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
 
 
@@ -121,10 +142,10 @@ class GroupMembership(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     group_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("groups.id"), nullable=False
+        String(36), nullable=False
     )
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     started_on: Mapped[date] = mapped_column(Date, nullable=False)
     ended_on: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -146,7 +167,7 @@ class WeeklySlot(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     group_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("groups.id"), nullable=False
+        String(36), nullable=False
     )
     weekday: Mapped[int] = mapped_column(Integer, nullable=False)
     start_time: Mapped[time] = mapped_column(Time, nullable=False)
@@ -168,10 +189,10 @@ class SchoolSession(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     group_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("groups.id"), nullable=False
+        String(36), nullable=False
     )
     weekly_slot_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("weekly_slots.id"), nullable=True
+        String(36), nullable=True
     )
     session_date: Mapped[date | None] = mapped_column(Date, nullable=True)
     overridden: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
@@ -199,7 +220,7 @@ class Price(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     product_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("products.id"), nullable=False
+        String(36), nullable=False
     )
     amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     valid_from: Mapped[date] = mapped_column(Date, nullable=False)
@@ -210,13 +231,13 @@ class Subscription(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     partner_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=True
+        String(36), nullable=True
     )
     product_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("products.id"), nullable=False
+        String(36), nullable=False
     )
     lessons_left: Mapped[int] = mapped_column(Integer, nullable=False)
     valid_until: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -240,7 +261,7 @@ class Payment(Base):
     amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     paid_on: Mapped[date] = mapped_column(Date, nullable=False)
     recorded_by_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=True
+        String(36), nullable=True
     )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -255,13 +276,13 @@ class Attendance(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("school_sessions.id"), nullable=False
     )
     marked_by_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=True
+        String(36), nullable=True
     )
     source: Mapped[str] = mapped_column(String(16), nullable=False)
     marked_at: Mapped[datetime] = mapped_column(
@@ -279,14 +300,14 @@ class DropInCharge(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("school_sessions.id"), nullable=False
     )
     amount: Mapped[Decimal] = mapped_column(Numeric(10, 2), nullable=False)
     price_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("prices.id"), nullable=False
+        String(36), nullable=False
     )
     charged_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
@@ -317,7 +338,7 @@ class BotChatMessage(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
     telegram_message_id: Mapped[int] = mapped_column(BigInteger, nullable=False)
@@ -337,7 +358,7 @@ class Reminder(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     kind: Mapped[str] = mapped_column(String(64), nullable=False)
     session_id: Mapped[str | None] = mapped_column(
@@ -366,7 +387,7 @@ class GuestRsvp(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     session_id: Mapped[str] = mapped_column(
         String(36), ForeignKey("school_sessions.id"), nullable=False
@@ -394,7 +415,7 @@ class DayGather(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=_new_id)
     person_id: Mapped[str] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=False
+        String(36), nullable=False
     )
     stream_id: Mapped[str | None] = mapped_column(
         String(36), ForeignKey("streams.id"), nullable=True
@@ -418,7 +439,7 @@ class ContactCard(Base):
     phone: Mapped[str] = mapped_column(String(32), nullable=False)
     role_label: Mapped[str] = mapped_column(String(255), nullable=False)
     person_id: Mapped[str | None] = mapped_column(
-        String(36), ForeignKey("persons.id"), nullable=True
+        String(36), nullable=True
     )
     archived_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

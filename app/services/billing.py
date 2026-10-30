@@ -4,10 +4,10 @@ from datetime import date, timedelta
 from decimal import Decimal
 from typing import Literal
 
-from sqlalchemy import or_, select
+from sqlalchemy import func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from app.models import Payment, Price, Product, Subscription
+from app.models import Payment, Price, Product, Reminder, Subscription
 
 PaymentStatus = Literal["paid", "unpaid", "unknown"]
 
@@ -151,6 +151,61 @@ async def record_payment(
     sub.amount_paid = sub.amount_paid + amount
     await session.flush()
     return payment
+
+
+async def subscription_payments_count(
+    session: AsyncSession, subscription_id: str
+) -> int:
+    result = await session.execute(
+        select(func.count())
+        .select_from(Payment)
+        .where(Payment.subscription_id == subscription_id)
+    )
+    return int(result.scalar_one())
+
+
+async def delete_subscription(session: AsyncSession, subscription_id: str) -> None:
+    """Remove a subscription that has no payments; otherwise refuse."""
+    sub = await session.get(Subscription, subscription_id)
+    if sub is None:
+        raise ValueError("subscription not found")
+    if sub.amount_paid > 0 or await subscription_payments_count(
+        session, subscription_id
+    ):
+        raise ValueError("subscription has payments")
+    await session.execute(
+        update(Reminder)
+        .where(Reminder.subscription_id == subscription_id)
+        .values(subscription_id=None)
+    )
+    await session.delete(sub)
+    await session.flush()
+
+
+async def update_subscription(
+    session: AsyncSession,
+    subscription_id: str,
+    *,
+    starts_on: date | None,
+    valid_until: date | None,
+    lessons_left: int,
+    amount_due: Decimal | None,
+) -> Subscription:
+    sub = await session.get(Subscription, subscription_id)
+    if sub is None:
+        raise ValueError("subscription not found")
+    if lessons_left < 0:
+        raise ValueError("lessons_left must not be negative")
+    if starts_on is not None and valid_until is not None and valid_until < starts_on:
+        raise ValueError("valid_until before starts_on")
+    if amount_due is not None and amount_due < sub.amount_paid:
+        raise ValueError("amount_due is less than already paid")
+    sub.starts_on = starts_on
+    sub.valid_until = valid_until
+    sub.lessons_left = lessons_left
+    sub.amount_due = amount_due
+    await session.flush()
+    return sub
 
 
 async def payable_subscription(
