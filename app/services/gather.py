@@ -20,7 +20,7 @@ from app.models import (
     Person,
     SchoolSession,
 )
-from app.services.notifications import record_coming
+from app.services.notifications import record_coming, record_not_coming
 from app.services.schedule import materialize_range
 from app.services.school_time import format_school_date, format_school_time, school_tz
 
@@ -145,12 +145,14 @@ def build_gather_message(full_name: str, lines: list[str], *, nudge: bool = Fals
         return (
             f"{full_name}, напоминаем про занятия сегодня:\n\n"
             f"{body}\n\n"
-            "Напишите номера тех, на которые придёте, через запятую."
+            "Напишите номера тех, на которые придёте, через запятую. "
+            "По остальным отметим, что не идёте."
         )
     return (
         f"Доброе утро, {full_name}! Сегодня занятия:\n\n"
         f"{body}\n\n"
-        "На какие придёте? Ответьте номерами через запятую."
+        "На какие придёте? Ответьте номерами через запятую. "
+        "По остальным отметим, что не идёте."
     )
 
 
@@ -315,11 +317,39 @@ async def apply_gather_selection(
         )
     day_gather.response = DayGatherResponse.COMING
     day_gather.selected_session_ids = ",".join(selected_ids)
-    for sid in selected_ids:
-        await record_coming(session, day_gather.person_id, sid, now)
+    selected = set(selected_ids)
+    for row in rows:
+        sid = row.school_session.id
+        if sid in selected:
+            await record_coming(session, day_gather.person_id, sid, now)
+        else:
+            await record_not_coming(session, day_gather.person_id, sid, now)
     await session.flush()
     body = "\n".join(chosen_lines)
-    return True, f"Записали:\n{body}"
+    reply = f"Записали:\n{body}"
+    if len(selected) < len(rows):
+        reply += "\n\nПо остальным отметили, что не идёте."
+    return True, reply
+
+
+async def decline_day_gather(
+    session: AsyncSession,
+    day_gather: DayGather,
+    now: datetime,
+) -> None:
+    """Mark the morning reply as a refusal and record it on each class that day.
+
+    The hour-before admin summary reads per-session reminders, so a day-level
+    refusal has to be written onto those rows or the person is counted as silent.
+    """
+    day_gather.response = DayGatherResponse.DECLINED
+    day_gather.selected_session_ids = None
+    rows = await sessions_for_person_on_date(
+        session, day_gather.person_id, day_gather.gather_date
+    )
+    for row in rows:
+        await record_not_coming(session, day_gather.person_id, row.school_session.id, now)
+    await session.flush()
 
 
 async def find_pending_day_gather(
@@ -338,8 +368,10 @@ async def find_pending_day_gather(
     return result.scalars().first()
 
 
-def _gather_status_ru(day_gather: DayGather, chosen: str) -> str:
+def _gather_status_ru(day_gather: DayGather, chosen: str, skipped: str = "") -> str:
     if day_gather.response == DayGatherResponse.COMING:
+        if chosen and skipped:
+            return f"идёт: {chosen}; не идёт: {skipped}"
         return f"идёт: {chosen}" if chosen else "идёт"
     if day_gather.response == DayGatherResponse.DECLINED:
         return "не идёт"
@@ -361,24 +393,31 @@ async def list_today_gather_summary(
     rows: list[tuple[DayGather, Person, str]] = []
     for day_gather, person in result.all():
         chosen = ""
+        skipped = ""
+        selected_ids: set[str] = set()
         if day_gather.selected_session_ids:
-            ids = [
+            selected_ids = {
                 part.strip()
                 for part in day_gather.selected_session_ids.split(",")
                 if part.strip()
+            }
+        if day_gather.response == DayGatherResponse.COMING:
+            person_rows = await sessions_for_person_on_date(
+                session, day_gather.person_id, day
+            )
+            chosen_parts = [
+                f"{format_school_time(row.school_session.starts_at)} «{row.group_name}»"
+                for row in person_rows
+                if row.school_session.id in selected_ids
             ]
-            if ids:
-                sessions = await session.execute(
-                    select(SchoolSession, Group)
-                    .join(Group, SchoolSession.group_id == Group.id)
-                    .where(SchoolSession.id.in_(ids))
-                )
-                parts = [
-                    f"{format_school_time(school_session.starts_at)} «{group.name}»"
-                    for school_session, group in sessions.all()
-                ]
-                chosen = ", ".join(parts)
-        detail = _gather_status_ru(day_gather, chosen)
+            skipped_parts = [
+                f"{format_school_time(row.school_session.starts_at)} «{row.group_name}»"
+                for row in person_rows
+                if row.school_session.id not in selected_ids
+            ]
+            chosen = ", ".join(chosen_parts)
+            skipped = ", ".join(skipped_parts)
+        detail = _gather_status_ru(day_gather, chosen, skipped)
         rows.append((day_gather, person, detail))
     return rows
 

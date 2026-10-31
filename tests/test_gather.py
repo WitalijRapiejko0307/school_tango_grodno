@@ -6,9 +6,10 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
 from app.db import Base
-from app.models import DayGather, Group, GroupMembership, Person
+from app.models import DayGather, Group, GroupMembership, Person, Reminder, ReminderResponse
 from app.services.gather import (
     apply_gather_selection,
+    decline_day_gather,
     in_morning_gather_window,
     morning_gather_due,
     nudge_deadline,
@@ -141,6 +142,94 @@ async def test_apply_gather_selection_parses_one_and_three(
     assert "Записали" in text
     assert day_gather.response == "coming"
     assert day_gather.selected_session_ids == rows[0].school_session.id
+
+
+@pytest.mark.asyncio
+async def test_partial_selection_declines_the_rest(
+    db_session: AsyncSession,
+) -> None:
+    stream = await create_stream(db_session, "Поток")
+    group = await create_group(db_session, "Два слота")
+    await set_group_stream(db_session, group.id, stream.id)
+    weekday = date(2026, 6, 2).weekday()
+    await create_weekly_slot(
+        db_session, group.id, weekday, time(10, 0), time(11, 0), "Зал", None
+    )
+    await create_weekly_slot(
+        db_session, group.id, weekday, time(19, 0), time(20, 0), "Зал", None
+    )
+    person = Person(full_name="Иван", role="client", telegram_user_id=1002)
+    db_session.add(person)
+    await db_session.flush()
+    await assign_group(db_session, person.id, group.id, started_on=date(2026, 1, 1))
+    gather_date = date(2026, 6, 2)
+    day_gather = DayGather(
+        person_id=person.id,
+        stream_id=stream.id,
+        gather_date=gather_date,
+        sent_at=datetime(2026, 6, 2, 6, 0, tzinfo=UTC),
+        response="none",
+    )
+    db_session.add(day_gather)
+    await db_session.flush()
+
+    from app.services.gather import sessions_for_person_on_date
+    from app.services.notifications import build_admin_session_summary_text
+
+    rows = await sessions_for_person_on_date(db_session, person.id, gather_date)
+    assert len(rows) == 2
+    now = datetime(2026, 6, 2, 7, 0, tzinfo=UTC)
+    ok, _text = await apply_gather_selection(db_session, day_gather, [1], now)
+    assert ok
+
+    reminders = list((await db_session.execute(select(Reminder))).scalars().all())
+    by_session = {reminder.session_id: reminder.response for reminder in reminders}
+    assert by_session[rows[0].school_session.id] == ReminderResponse.COMING
+    assert by_session[rows[1].school_session.id] == ReminderResponse.DECLINED
+
+    later = await build_admin_session_summary_text(
+        db_session, rows[1].school_session, group
+    )
+    assert "идут — 0, не идут — 1, не ответили — 0" in later
+
+
+@pytest.mark.asyncio
+async def test_decline_day_gather_counts_in_hour_summary(
+    db_session: AsyncSession,
+) -> None:
+    stream = await create_stream(db_session, "Поток")
+    group = await create_group(db_session, "Группа")
+    await set_group_stream(db_session, group.id, stream.id)
+    weekday = date(2026, 6, 2).weekday()
+    await create_weekly_slot(
+        db_session, group.id, weekday, time(19, 0), time(20, 0), "Зал", None
+    )
+    person = Person(full_name="Мария", role="client", telegram_user_id=1003)
+    db_session.add(person)
+    await db_session.flush()
+    await assign_group(db_session, person.id, group.id, started_on=date(2026, 1, 1))
+    gather_date = date(2026, 6, 2)
+    day_gather = DayGather(
+        person_id=person.id,
+        stream_id=stream.id,
+        gather_date=gather_date,
+        sent_at=datetime(2026, 6, 2, 6, 0, tzinfo=UTC),
+        response="none",
+    )
+    db_session.add(day_gather)
+    await db_session.flush()
+
+    from app.services.gather import sessions_for_person_on_date
+    from app.services.notifications import build_admin_session_summary_text
+
+    rows = await sessions_for_person_on_date(db_session, person.id, gather_date)
+    assert len(rows) == 1
+    now = datetime(2026, 6, 2, 7, 0, tzinfo=UTC)
+    await decline_day_gather(db_session, day_gather, now)
+    summary = await build_admin_session_summary_text(
+        db_session, rows[0].school_session, group
+    )
+    assert "идут — 0, не идут — 1, не ответили — 0" in summary
 
 
 @pytest.mark.asyncio

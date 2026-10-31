@@ -12,6 +12,7 @@ from app.models import DayGather, DayGatherResponse
 from app.services.billing import person_has_unpaid_started
 from app.services.gather import (
     apply_gather_selection,
+    decline_day_gather,
     find_pending_day_gather,
     local_school_date,
     parse_gather_indexes,
@@ -45,7 +46,7 @@ async def cb_gather_no(query: CallbackQuery) -> None:
             await query.answer("Сообщение устарело")
             return
         if day_gather.response == DayGatherResponse.NONE:
-            day_gather.response = DayGatherResponse.DECLINED
+            await decline_day_gather(session, day_gather, datetime.now(UTC))
             await session.commit()
     await query.answer()
     if query.message:
